@@ -1,0 +1,111 @@
+use "std -> option" from "option"
+
+mod hlib_error
+mod hlib_sys
+mod hlib_bytes
+
+pub struct KeyPair is
+    pub signing_hex: string
+    pub verifying_hex: string
+end
+
+pub fn sha256(b: hlib_bytes::Buf) -> hlib_bytes::Buf is
+    hlib_sys::sodium_init()
+    let out: hlib_bytes::Buf = hlib_bytes::buf_new(32)
+    hlib_sys::crypto_hash_sha256(out.p, b.p, b.n)
+    return out
+end
+
+pub fn sha256_hex(b: hlib_bytes::Buf) -> string is
+    let d: hlib_bytes::Buf = sha256(b)
+    let h: string = hlib_bytes::hex_encode(d)
+    hlib_bytes::buf_free(d)
+    return h
+end
+
+pub fn sha256_hex_str(s: string) -> string is
+    return sha256_hex(hlib_bytes::buf_from_str(s))
+end
+
+fn key_bytes(hex: string, what: string) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    match hlib_bytes::hex_decode(hlib_bytes::trim_ws(hex)) is
+        option::Result::Err(e) => is return option::Result::Err(hlib_error::bad_key(e)) end
+        option::Result::Ok(b) => is
+            if b.n != 32 is
+                hlib_bytes::buf_free(b)
+                return option::Result::Err(hlib_error::bad_key(what + " must be exactly 32 bytes (64 hex chars)"))
+            end
+            return option::Result::Ok(b)
+        end
+    end
+end
+
+;; A fresh random keypair (libsodium's CSPRNG). Keep `signing_hex` secret.
+pub fn generate_keypair() -> KeyPair is
+    hlib_sys::sodium_init()
+    let pk: hlib_bytes::Buf = hlib_bytes::buf_new(32)
+    let sk: hlib_bytes::Buf = hlib_bytes::buf_new(64)
+    hlib_sys::crypto_sign_keypair(pk.p, sk.p)
+    let seed: hlib_bytes::Buf = hlib_bytes::buf_slice(sk, 0, 32)
+    let pair: KeyPair = KeyPair { signing_hex: hlib_bytes::hex_encode(seed), verifying_hex: hlib_bytes::hex_encode(pk) }
+    hlib_sys::sodium_memzero(sk.p, 64)
+    hlib_sys::sodium_memzero(seed.p, 32)
+    hlib_bytes::buf_free(sk)
+    hlib_bytes::buf_free(seed)
+    hlib_bytes::buf_free(pk)
+    return pair
+end
+
+;; the public key (hex) that belongs to a signing key (hex)
+pub fn public_key_hex(signing_hex: string) -> option::Result<string, hlib_error::HlibError> is
+    let seed: hlib_bytes::Buf = key_bytes(signing_hex, "signing key")?
+    let pk: hlib_bytes::Buf = hlib_bytes::buf_new(32)
+    let sk: hlib_bytes::Buf = hlib_bytes::buf_new(64)
+    hlib_sys::sodium_init()
+    hlib_sys::crypto_sign_seed_keypair(pk.p, sk.p, seed.p)
+    let hex: string = hlib_bytes::hex_encode(pk)
+    hlib_sys::sodium_memzero(sk.p, 64)
+    hlib_sys::sodium_memzero(seed.p, 32)
+    hlib_bytes::buf_free(sk)
+    hlib_bytes::buf_free(seed)
+    hlib_bytes::buf_free(pk)
+    return option::Result::Ok(hex)
+end
+
+;; raw 64-byte detached signature of `message`
+pub fn sign(signing_hex: string, message: hlib_bytes::Buf) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    let seed: hlib_bytes::Buf = key_bytes(signing_hex, "signing key")?
+    let pk: hlib_bytes::Buf = hlib_bytes::buf_new(32)
+    let sk: hlib_bytes::Buf = hlib_bytes::buf_new(64)
+    hlib_sys::sodium_init()
+    hlib_sys::crypto_sign_seed_keypair(pk.p, sk.p, seed.p)
+    let sig: hlib_bytes::Buf = hlib_bytes::buf_new(64)
+    hlib_sys::crypto_sign_detached(sig.p, 0, message.p, message.n, sk.p)
+    hlib_sys::sodium_memzero(sk.p, 64)
+    hlib_sys::sodium_memzero(seed.p, 32)
+    hlib_bytes::buf_free(sk)
+    hlib_bytes::buf_free(seed)
+    hlib_bytes::buf_free(pk)
+    return option::Result::Ok(sig)
+end
+
+;; Ok(true) = valid signature; Ok(false) = well-formed but wrong; Err = unusable key / signature length.
+;; A public key that is not a point on the curve is `bad_key` (as in ed25519-dalek), not "false".
+pub fn verify(pubkey_hex: string, message: hlib_bytes::Buf, sig: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    let pk: hlib_bytes::Buf = key_bytes(pubkey_hex, "public key")?
+    if sig.n != 64 is
+        hlib_bytes::buf_free(pk)
+        return option::Result::Err(hlib_error::bad_key("signature must be exactly 64 bytes"))
+    end
+    hlib_sys::sodium_init()
+    let probe: hlib_bytes::Buf = hlib_bytes::buf_new(32)
+    if hlib_sys::crypto_core_ed25519_add(probe.p, pk.p, pk.p) != 0 is
+        hlib_bytes::buf_free(pk)
+        hlib_bytes::buf_free(probe)
+        return option::Result::Err(hlib_error::bad_key("signature error: Cannot decompress Edwards point"))
+    end
+    let ok: bool = hlib_sys::crypto_sign_verify_detached(sig.p, message.p, message.n, pk.p) == 0
+    hlib_bytes::buf_free(pk)
+    hlib_bytes::buf_free(probe)
+    return option::Result::Ok(ok)
+end
