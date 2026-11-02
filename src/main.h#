@@ -1,0 +1,12 @@
+mod hlib_cli
+
+fn main() is
+    let all: [string] = env_args()
+    let mut args: [string] = []
+    let mut i: int = 1
+    while i < all.len() is
+        args.push(all[i])
+        i += 1
+    end
+    exit(hlib_cli::run(args))
+end
