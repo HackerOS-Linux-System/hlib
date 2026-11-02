@@ -1,0 +1,28 @@
+use "std -> option" from "option"
+use "bit -> hlib" from "hlib"
+
+fn main() is
+    let args: [string] = env_args()
+    if args.len() < 2 is
+        write("usage: verify-example FILE [TRUSTED_PUBLIC_KEY_HEX]")
+        exit(2)
+    end
+    let key: string = if args.len() > 2 is args[2] else "" end
+    match hlib::open(args[1]) is
+        option::Result::Ok(a) => is
+            let m: hlib::manifest::Manifest = a.manifest
+            write(m.name + " " + m.version + " (" + m.language + ") — " + to_string(m.artifacts.len()) + " artifact(s)")
+            let r: hlib::archive::Report = hlib::check(a, key)
+            if r.ok is
+                write("strict verification: OK" + (if r.trusted is " (trusted signature)" else "" end))
+            else
+                for p in r.problems is write("PROBLEM: " + p) end
+                exit(1)
+            end
+        end
+        option::Result::Err(e) => is
+            write("error [" + e.code + "]: " + e.message)
+            exit(1)
+        end
+    end
+end
