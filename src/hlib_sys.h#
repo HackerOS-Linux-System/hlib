@@ -1,0 +1,49 @@
+extern static [c] is
+    fn malloc(n: int) -> int
+    fn calloc(n: int, sz: int) -> int
+    fn realloc(p: int, n: int) -> int
+    fn free(p: int)
+    fn memcpy(dst: int, src: int, n: int) -> int
+    fn memset(dst: int, c: int, n: int) -> int
+    fn memcmp(a: int, b: int, n: int) -> int
+    fn strcpy(dst: int, src: string) -> int
+    fn strndup(p: int, n: int) -> string
+    fn fopen(path: string, mode: string) -> int
+    fn fread(p: int, sz: int, n: int, f: int) -> int
+    fn fwrite(p: int, sz: int, n: int, f: int) -> int
+    fn fclose(f: int) -> int
+    fn fflush(f: int) -> int
+    fn fileno(f: int) -> int
+    fn fsync(fd: int) -> int
+    fn fseek(f: int, off: int, whence: int) -> int
+    fn ftell(f: int) -> int
+    fn fdopen(fd: int, mode: string) -> int
+    fn rename(src_path: string, dst_path: string) -> int
+    fn remove(path: string) -> int
+    fn mkdir(path: string, mode: int) -> int
+    fn chmod(path: string, mode: int) -> int
+    fn getpid() -> int
+end
+
+extern static [c, "zstd"] is
+    fn ZSTD_compressBound(n: int) -> int
+    fn ZSTD_compress(dst: int, cap: int, src: int, n: int, level: int) -> int
+    fn ZSTD_isError(code: int) -> int
+    fn ZSTD_maxCLevel() -> int
+    fn ZSTD_createDStream() -> int
+    fn ZSTD_initDStream(ds: int) -> int
+    fn ZSTD_decompressStream(ds: int, out: int, inp: int) -> int
+    fn ZSTD_freeDStream(ds: int) -> int
+end
+
+extern static [c, "sodium"] is
+    fn sodium_init() -> int
+    fn sodium_memcmp(a: int, b: int, n: int) -> int
+    fn crypto_hash_sha256(out: int, inp: int, n: int) -> int
+    fn crypto_sign_keypair(pk: int, sk: int) -> int
+    fn crypto_sign_seed_keypair(pk: int, sk: int, seed: int) -> int
+    fn crypto_sign_detached(sig: int, siglen: int, m: int, mlen: int, sk: int) -> int
+    fn crypto_sign_verify_detached(sig: int, m: int, mlen: int, pk: int) -> int
+    fn crypto_core_ed25519_add(r: int, p: int, q: int) -> int
+    fn sodium_memzero(p: int, n: int)
+end
