@@ -1,0 +1,548 @@
+use "std -> option" from "option"
+use "std -> test" from "test"
+use "std -> fs" from "fs"
+
+mod hlib_bytes
+mod hlib_error
+
+#[test]
+fn bytes_hex_roundtrip() is
+    let b: hlib_bytes::Buf = hlib_bytes::buf_from_str("hello\n")
+    test::assert_true(hlib_bytes::hex_encode(b) == "68656c6c6f0a")
+    match hlib_bytes::hex_decode("68656C6c6f0a") is
+        option::Result::Ok(d) => is test::assert_true(hlib_bytes::buf_eq(d, b)) end
+        option::Result::Err(e) => is test::fail(e) end
+    end
+    match hlib_bytes::hex_decode("abc") is
+        option::Result::Ok(d) => is test::fail("odd length must fail") end
+        option::Result::Err(e) => is test::assert_true(e == "Odd number of digits") end
+    end
+    match hlib_bytes::hex_decode("zz") is
+        option::Result::Ok(d) => is test::fail("bad digit must fail") end
+        option::Result::Err(e) => is test::assert_true(e == "Invalid character 'z' at position 0") end
+    end
+end
+
+#[test]
+fn bytes_utf8() is
+    let ok: hlib_bytes::Buf = hlib_bytes::buf_from_str("zażółć 😀")
+    test::assert_true(hlib_bytes::utf8_valid(ok, 0, ok.n))
+    let bad: hlib_bytes::Buf = hlib_bytes::buf_new(2)
+    hlib_bytes::buf_set(bad, 0, 195)
+    hlib_bytes::buf_set(bad, 1, 40)
+    test::assert_true(!hlib_bytes::utf8_valid(bad, 0, 2))
+    let over: hlib_bytes::Buf = hlib_bytes::buf_new(2)
+    hlib_bytes::buf_set(over, 0, 192)
+    hlib_bytes::buf_set(over, 1, 128)
+    test::assert_true(!hlib_bytes::utf8_valid(over, 0, 2))
+    test::assert_true(hlib_bytes::utf8_encode(955) == "λ")
+    test::assert_true(hlib_bytes::utf8_encode(128512) == "😀")
+end
+
+#[test]
+fn bytes_file_roundtrip() is
+    let path: string = "/tmp/hlib_t_bytes_" + to_string(os::pid()) + ".bin"
+    let b: hlib_bytes::Buf = hlib_bytes::buf_new(300)
+    let mut i: int = 0
+    while i < 300 is
+        hlib_bytes::buf_set(b, i, i % 256)
+        i += 1
+    end
+    match hlib_bytes::write_file(path, b) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    match hlib_bytes::read_file(path, 0) is
+        option::Result::Ok(r) => is test::assert_true(hlib_bytes::buf_eq(r, b)) end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    match hlib_bytes::read_file(path, 100) is
+        option::Result::Ok(r) => is test::fail("limit must trigger") end
+        option::Result::Err(e) => is test::assert_true(e.code == "limit") end
+    end
+    fs::remove(path)
+end
+
+#[test]
+fn bytes_strings() is
+    test::assert_true(hlib_bytes::cmp_str("a", "b") == -1)
+    test::assert_true(hlib_bytes::cmp_str("b", "a") == 1)
+    test::assert_true(hlib_bytes::cmp_str("ab", "ab") == 0)
+    test::assert_true(hlib_bytes::cmp_str("a", "ab") == -1)
+    test::assert_true(hlib_bytes::trim_ws("  x\n") == "x")
+    test::assert_true(hlib_bytes::ends_with("foo.hlib", ".hlib"))
+    test::assert_true(hlib_bytes::find_from("abcabc", "ca", 0) == 2)
+    test::assert_true(hlib_bytes::is_hex("00ff", 4) && !hlib_bytes::is_hex("00fg", 4))
+    test::assert_true(hlib_bytes::parent_dir("a/b/c.txt") == "a/b")
+end
+
+;; ── crypto / zstd / tar ───────────────────────────────────────────────────────
+mod hlib_crypto
+mod hlib_zstd
+mod hlib_tar
+mod hlib_limits
+
+fn ck(c: bool, what: string) is
+    if !c is test::fail(what) end
+end
+
+fn bs(s: string) -> hlib_bytes::Buf is
+    return hlib_bytes::buf_from_str(s)
+end
+
+#[test]
+fn crypto_sha256_vectors() is
+    test::assert_true(hlib_crypto::sha256_hex_str("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    test::assert_true(hlib_crypto::sha256_hex_str("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+end
+
+#[test]
+fn crypto_ed25519_rfc8032_vector() is
+    ;; RFC 8032 §7.1, TEST 1 (empty message)
+    let seed: string = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+    let pubk: string = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    let expect: string = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+    match hlib_crypto::public_key_hex(seed) is
+        option::Result::Ok(p) => is test::assert_true(p == pubk) end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    let msg: hlib_bytes::Buf = hlib_bytes::buf_new(0)
+    match hlib_crypto::sign(seed, msg) is
+        option::Result::Ok(sig) => is
+            test::assert_true(hlib_bytes::hex_encode(sig) == expect)
+            match hlib_crypto::verify(pubk, msg, sig) is
+                option::Result::Ok(v) => is test::assert_true(v) end
+                option::Result::Err(e) => is test::fail(e.message) end
+            end
+            let other: hlib_bytes::Buf = bs("x")
+            match hlib_crypto::verify(pubk, other, sig) is
+                option::Result::Ok(v) => is test::assert_true(!v) end
+                option::Result::Err(e) => is test::fail(e.message) end
+            end
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+end
+
+#[test]
+fn crypto_key_errors() is
+    match hlib_crypto::public_key_hex("abcd") is
+        option::Result::Ok(_) => is test::fail("short key must fail") end
+        option::Result::Err(e) => is
+            test::assert_true(e.code == "bad_key")
+            test::assert_true(e.message == "invalid ed25519 key material: signing key must be exactly 32 bytes (64 hex chars)")
+        end
+    end
+    match hlib_crypto::public_key_hex("zz") is
+        option::Result::Ok(_) => is test::fail("bad hex must fail") end
+        option::Result::Err(e) => is test::assert_true(e.code == "bad_key") end
+    end
+    let kp: hlib_crypto::KeyPair = hlib_crypto::generate_keypair()
+    test::assert_true(kp.signing_hex.len() == 64 && kp.verifying_hex.len() == 64)
+    match hlib_crypto::public_key_hex(kp.signing_hex) is
+        option::Result::Ok(p) => is test::assert_true(p == kp.verifying_hex) end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+end
+
+#[test]
+fn zstd_roundtrip_and_limits() is
+    let mut sb: string = ""
+    let mut i: int = 0
+    while i < 2000 is
+        sb += "hlib line " + to_string(i) + "\n"
+        i += 1
+    end
+    let src: hlib_bytes::Buf = bs(sb)
+    match hlib_zstd::compress(src, 19) is
+        option::Result::Ok(c) => is
+            test::assert_true(c.n < src.n)
+            match hlib_zstd::decompress(c, 0) is
+                option::Result::Ok(d) => is test::assert_true(hlib_bytes::buf_eq(d, src)) end
+                option::Result::Err(e) => is test::fail(e.message) end
+            end
+            match hlib_zstd::decompress(c, 1000) is
+                option::Result::Ok(d) => is test::fail("limit must trigger") end
+                option::Result::Err(e) => is test::assert_true(e.code == "limit") end
+            end
+            let cut: hlib_bytes::Buf = hlib_bytes::buf_slice(c, 0, c.n / 2)
+            match hlib_zstd::decompress(cut, 0) is
+                option::Result::Ok(d) => is test::fail("truncated frame must fail") end
+                option::Result::Err(e) => is test::assert_true(e.code == "zstd") end
+            end
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    match hlib_zstd::decompress(bs("this is not zstd data"), 0) is
+        option::Result::Ok(d) => is test::fail("garbage must fail") end
+        option::Result::Err(e) => is test::assert_true(e.code == "zstd") end
+    end
+end
+
+#[test]
+fn tar_roundtrip_incl_long_names() is
+    let long: string = "extra/" + "very-long-directory-name/" + "another-long-directory-name/" + "and-another-one-here/" + "file-with-a-long-name.txt"
+    ck(long.len() > 100, "long name is > 100")
+    let es: [hlib_tar::Entry] = [
+        hlib_tar::Entry { path: "manifest.json", data: bs("ab") },
+        hlib_tar::Entry { path: "empty", data: hlib_bytes::buf_new(0) },
+        hlib_tar::Entry { path: long, data: bs("long-content") },
+        hlib_tar::Entry { path: "native/x86_64-unknown-linux-gnu/a.so", data: hlib_bytes::buf_new(1500) }
+    ]
+    match hlib_tar::write(es, 0) is
+        option::Result::Ok(t) => is
+            ck(t.n % 512 == 0, "tar length is a multiple of 512: " + to_string(t.n))
+            match hlib_tar::read(t, hlib_limits::default_limits()) is
+                option::Result::Ok(back) => is
+                    ck(back.len() == 4, "4 entries, got " + to_string(back.len()))
+                    ck(back[0].path == "manifest.json", "path0 " + back[0].path)
+                    ck(back[0].data.n == 2, "size0")
+                    ck(back[1].path == "empty", "path1 " + back[1].path)
+                    ck(back[1].data.n == 0, "size1")
+                    ck(back[2].path == long, "path2 " + back[2].path)
+                    ck(hlib_bytes::buf_to_str(back[2].data) == "long-content", "data2")
+                    ck(back[3].data.n == 1500, "size3")
+                end
+                option::Result::Err(e) => is test::fail(e.message) end
+            end
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+end
+
+#[test]
+fn tar_rejects_unsafe_paths_on_write() is
+    let bad: [string] = ["../x", "/etc/passwd", "a/../b", "a//b", "a\\b", "", "./", "C:/x", "a/./b"]
+    for p in bad is
+        let es: [hlib_tar::Entry] = [hlib_tar::Entry { path: p, data: bs("x") }]
+        match hlib_tar::write(es, 0) is
+            option::Result::Ok(_) => is test::fail("path should be refused: " + p) end
+            option::Result::Err(e) => is test::assert_true(e.code == "unsafe_path") end
+        end
+    end
+end
+
+#[test]
+fn tar_reader_rejects_corruption_and_links() is
+    let es: [hlib_tar::Entry] = [hlib_tar::Entry { path: "a.txt", data: bs("hello") }]
+    match hlib_tar::write(es, 0) is
+        option::Result::Ok(t) => is
+            ;; flip a byte of the name -> header checksum no longer matches
+            let c: hlib_bytes::Buf = hlib_bytes::buf_copy(t)
+            hlib_bytes::buf_set(c, 0, 66)
+            match hlib_tar::read(c, hlib_limits::default_limits()) is
+                option::Result::Ok(_) => is test::fail("corrupt header must fail") end
+                option::Result::Err(e) => is test::assert_true(e.code == "tar") end
+            end
+            ;; entry limit
+            let tiny: hlib_limits::Limits = hlib_limits::Limits {
+                max_archive_bytes: 1000000, max_unpacked_bytes: 1000000, max_entry_bytes: 3,
+                max_entries: 10, max_manifest_bytes: 1000, max_json_depth: 8
+            }
+            match hlib_tar::read(t, tiny) is
+                option::Result::Ok(_) => is test::fail("entry size limit must trigger") end
+                option::Result::Err(e) => is test::assert_true(e.code == "limit") end
+            end
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+end
+
+;; ── json / manifest ───────────────────────────────────────────────────────────
+mod hlib_json
+mod hlib_manifest
+
+fn jp(s: string) -> option::Result<hlib_json::JDoc, string> is
+    return hlib_json::parse(bs(s), 16)
+end
+
+#[test]
+fn json_parses_values() is
+    match jp("  \{\"a\": [1, 2.5e3, -0, true, false, null], \"s\": \"x\\u00e9\\n\\ud83d\\ude00\", \"o\": \{\}\}  ") is
+        option::Result::Ok(d) => is
+            let a: int = hlib_json::get(d, d.root, "a")
+            ck(hlib_json::len(d, a) == 6, "array len")
+            ck(hlib_json::uint_of(d, hlib_json::at(d, a, 0)) == 1, "uint")
+            ck(hlib_json::kind(d, hlib_json::at(d, a, 1)) == 2, "num kind")
+            ck(hlib_json::bool_of(d, hlib_json::at(d, a, 3)), "true")
+            ck(hlib_json::kind(d, hlib_json::at(d, a, 5)) == 0, "null")
+            ck(hlib_json::str_of(d, hlib_json::get(d, d.root, "s")) == "xé\n😀", "string escapes")
+            ck(hlib_json::len(d, hlib_json::get(d, d.root, "o")) == 0, "empty object")
+        end
+        option::Result::Err(e) => is test::fail(e) end
+    end
+end
+
+#[test]
+fn json_rejects_bad_documents() is
+    let bad: [string] = [
+        "", "\{", "[1,]", "\{\"a\":1,\}", "\{\"a\":1 \"b\":2\}", "\{\"a\":1,\"a\":2\}", "01", "1.", "\"\\x\"",
+        "\"\\ud800\"", "\"\\u0000\"", "[1] x", "tru", "\{a:1\}", "\"line\nbreak\"", "[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]"
+    ]
+    for s in bad is
+        match jp(s) is
+            option::Result::Ok(_) => is test::fail("should be rejected: " + s) end
+            option::Result::Err(_) => is end
+        end
+    end
+end
+
+fn sample_manifest() -> hlib_manifest::Manifest is
+    let m: hlib_manifest::Manifest = hlib_manifest::empty()
+    m.name = "demo"
+    m.version = "1.2.0"
+    m.language = "hsharp"
+    m.edition = "2026"
+    m.language_version = "0.9.0"
+    m.description = "quote \" and \\ and ł"
+    m.authors = ["A", "B"]
+    m.created_at = "2026-11-01T12:00:00Z"
+    m.dependencies = [hlib_manifest::Dependency { name: "dep", version_req: "^1.0" }]
+    m.artifacts = [hlib_manifest::Artifact { path: "native/x/demo.so", kind: "shared_object", target: "x", sha256: "ab", size: 7 }]
+    m.exports = [hlib_manifest::Export { name: "add", kind: "function", signature: "fn add(a: i64) -> i64", params: ["i64", "opaque:Thing"], returns: "i64", generic: false, is_macro: false }]
+    return m
+end
+
+#[test]
+fn manifest_roundtrip_and_format() is
+    let m: hlib_manifest::Manifest = sample_manifest()
+    let text: string = hlib_manifest::to_json(m)
+    ck(hlib_bytes::starts_with(text, "\{\n  \"hlib_spec_version\": 1,\n  \"name\": \"demo\","), "serde-style head")
+    ck(hlib_bytes::find_from(text, "\"type\": \"opaque\",\n          \"struct_name\": \"Thing\"", 0) > 0, "nested pretty params")
+    match hlib_manifest::parse(bs(text), hlib_limits::default_limits()) is
+        option::Result::Ok(b) => is
+            ck(b.name == "demo" && b.version == "1.2.0" && b.edition == "2026", "scalars")
+            ck(b.description == m.description, "escapes survive")
+            ck(b.authors.len() == 2 && b.dependencies[0].version_req == "^1.0", "lists")
+            ck(b.artifacts[0].size == 7 && b.artifacts[0].target == "x", "artifact")
+            ck(b.exports[0].params[1] == "opaque:Thing" && b.exports[0].returns == "i64", "export abi")
+            ck(!b.signed, "unsigned")
+            ck(hlib_manifest::to_json(b) == text, "stable re-serialisation")
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+end
+
+#[test]
+fn manifest_validation() is
+    let lim: hlib_limits::Limits = hlib_limits::default_limits()
+    match hlib_manifest::parse(bs("\{\"name\":\"x\"\}"), lim) is
+        option::Result::Ok(_) => is test::fail("missing fields") end
+        option::Result::Err(e) => is ck(e.code == "manifest", "code") end
+    end
+    let m: hlib_manifest::Manifest = sample_manifest()
+    m.spec_version = 2
+    match hlib_manifest::parse(bs(hlib_manifest::to_json(m)), lim) is
+        option::Result::Ok(_) => is test::fail("newer spec") end
+        option::Result::Err(e) => is ck(e.code == "unsupported_spec", "newer spec code") end
+    end
+    let m2: hlib_manifest::Manifest = sample_manifest()
+    m2.edition = "1999"
+    match hlib_manifest::parse(bs(hlib_manifest::to_json(m2)), lim) is
+        option::Result::Ok(_) => is test::fail("edition") end
+        option::Result::Err(e) => is ck(e.code == "unsupported_edition", "edition code") end
+    end
+    let m3: hlib_manifest::Manifest = sample_manifest()
+    m3.language = "cobol"
+    match hlib_manifest::parse(bs(hlib_manifest::to_json(m3)), lim) is
+        option::Result::Ok(_) => is test::fail("language") end
+        option::Result::Err(e) => is ck(e.code == "manifest", "language code") end
+    end
+    ck(hlib_manifest::valid_name("my-lib_2.x"), "valid name")
+    ck(!hlib_manifest::valid_name("../x") && !hlib_manifest::valid_name("") && !hlib_manifest::valid_name(".hid") && !hlib_manifest::valid_name("a b"), "invalid names")
+end
+
+;; ── archive / build ───────────────────────────────────────────────────────────
+mod hlib_archive
+mod hlib_build
+
+fn mk_builder() -> hlib_build::Builder is
+    match hlib_build::builder_new("demo", "1.0.0", "hs") is
+        option::Result::Ok(b) => is
+            b.created_at = "2026-11-01T12:00:00Z"
+            b.description = "demo lib"
+            b.level = 3
+            hlib_build::add_author(b, "me")
+            hlib_build::add_ast(b, bs("fun x() [ ]\n"))
+            hlib_build::add_extra(b, "LICENSE", bs("MIT"))
+            hlib_build::add_shared_object(b, "x86_64-unknown-linux-gnu", bs("ELF-ish"))
+            return b
+        end
+        option::Result::Err(e) => is
+            test::fail(e.message)
+            return hlib_build::Builder { name: "", version: "", language: "", language_version: "", edition: "", description: "", authors: [], dependencies: [], exports: [], artifacts: [], entries: [], created_at: "", level: 3 }
+        end
+    end
+end
+
+fn built(key: string) -> hlib_build::Built is
+    match hlib_build::build_bytes(mk_builder(), key) is
+        option::Result::Ok(x) => is return x end
+        option::Result::Err(e) => is
+            test::fail(e.message)
+            return hlib_build::Built { archive: hlib_bytes::buf_new(0), manifest: hlib_manifest::empty() }
+        end
+    end
+end
+
+fn opened(b: hlib_bytes::Buf) -> hlib_archive::Archive is
+    match hlib_archive::open_bytes(b, "mem.hlib", hlib_limits::default_limits()) is
+        option::Result::Ok(a) => is return a end
+        option::Result::Err(e) => is
+            test::fail("open: " + e.message)
+            return hlib_archive::Archive { path: "", manifest: hlib_manifest::empty(), entries: [], order: [] }
+        end
+    end
+end
+
+#[test]
+fn build_open_check_unsigned() is
+    let bt: hlib_build::Built = built("")
+    let a: hlib_archive::Archive = opened(bt.archive)
+    ck(a.manifest.name == "demo" && a.manifest.language == "hackerscript", "manifest")
+    ck(a.manifest.edition == "", "no edition for hackerscript")
+    ck(a.manifest.artifacts.len() == 3, "3 artifacts")
+    let paths: [string] = hlib_archive::entry_paths(a)
+    ck(paths.len() == 5, "5 entries")
+    ck(hlib_archive::has_entry(a, "ast/demo.hcs") && hlib_archive::has_entry(a, "extra/LICENSE") && hlib_archive::has_entry(a, "native/x86_64-unknown-linux-gnu/demo.so"), "paths")
+    ck(!hlib_archive::has_entry(a, "SIGNATURE.ed25519"), "no signature entry")
+    match hlib_archive::verify_checksums(a) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    let r: hlib_archive::Report = hlib_archive::check(a, "")
+    ck(r.ok && !r.signed, "strict ok: " + hlib_bytes::join(r.problems, "; "))
+    match hlib_archive::verify_signature(a, "00") is
+        option::Result::Ok(_) => is test::fail("unsigned") end
+        option::Result::Err(e) => is ck(e.code == "unsigned", "unsigned code") end
+    end
+end
+
+#[test]
+fn build_is_reproducible() is
+    let a1: hlib_build::Built = built("")
+    let a2: hlib_build::Built = built("")
+    ck(hlib_bytes::buf_eq(a1.archive, a2.archive), "identical bytes for identical input")
+end
+
+#[test]
+fn signing_and_trust() is
+    let kp: hlib_crypto::KeyPair = hlib_crypto::generate_keypair()
+    let other: hlib_crypto::KeyPair = hlib_crypto::generate_keypair()
+    let bt: hlib_build::Built = built(kp.signing_hex)
+    let a: hlib_archive::Archive = opened(bt.archive)
+    ck(a.manifest.signed && a.manifest.sig_public_key == kp.verifying_hex, "signed manifest")
+    let ok: hlib_archive::Report = hlib_archive::check(a, kp.verifying_hex)
+    ck(ok.ok && ok.signed && ok.signature_valid && ok.trusted, "trusted ok: " + hlib_bytes::join(ok.problems, "; "))
+    let selfc: hlib_archive::Report = hlib_archive::check(a, "")
+    ck(selfc.ok && selfc.signature_valid && !selfc.trusted, "embedded-key check is not trust")
+    let wrong: hlib_archive::Report = hlib_archive::check(a, other.verifying_hex)
+    ck(!wrong.ok, "wrong trusted key must fail")
+    match hlib_archive::verify_signature(a, other.verifying_hex) is
+        option::Result::Ok(_) => is test::fail("wrong key") end
+        option::Result::Err(e) => is ck(e.code == "bad_signature", "bad_signature code") end
+    end
+end
+
+;; rebuild the tar with one entry's bytes changed, keeping everything else
+fn tampered(src: hlib_archive::Archive, victim: string, data: string) -> hlib_bytes::Buf is
+    let mut es: [hlib_tar::Entry] = []
+    for e in src.entries is
+        if e.path == victim is
+            es.push(hlib_tar::Entry { path: e.path, data: bs(data) })
+        else
+            es.push(e)
+        end
+    end
+    match hlib_tar::write(es, 0) is
+        option::Result::Ok(t) => is
+            match hlib_zstd::compress(t, 3) is
+                option::Result::Ok(c) => is return c end
+                option::Result::Err(e) => is test::fail(e.message) end
+            end
+        end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    return hlib_bytes::buf_new(0)
+end
+
+#[test]
+fn tampering_is_detected() is
+    let a: hlib_archive::Archive = opened(built("").archive)
+    let t: hlib_archive::Archive = opened(tampered(a, "ast/demo.hcs", "fun evil() [ ]\n"))
+    match hlib_archive::verify_checksums(t) is
+        option::Result::Ok(_) => is test::fail("tampered content must fail") end
+        option::Result::Err(e) => is ck(e.code == "checksum_mismatch", "mismatch code") end
+    end
+    ck(!hlib_archive::check(t, "").ok, "strict also fails")
+    ;; an extra file CHECKSUMS does not cover: compat level accepts it, strict level must not
+    let mut es: [hlib_tar::Entry] = []
+    for e in a.entries is es.push(e) end
+    es.push(hlib_tar::Entry { path: "native/evil.so", data: bs("payload") })
+    let tar2: hlib_bytes::Buf = match hlib_tar::write(es, 0) is
+        option::Result::Ok(x) => is x end
+        option::Result::Err(e) => is hlib_bytes::buf_new(0) end
+    end
+    let comp2: hlib_bytes::Buf = match hlib_zstd::compress(tar2, 3) is
+        option::Result::Ok(x) => is x end
+        option::Result::Err(e) => is hlib_bytes::buf_new(0) end
+    end
+    let u: hlib_archive::Archive = opened(comp2)
+    match hlib_archive::verify_checksums(u) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is test::fail("compat level should accept: " + e.message) end
+    end
+    let r: hlib_archive::Report = hlib_archive::check(u, "")
+    ck(!r.ok && hlib_bytes::find_from(hlib_bytes::join(r.problems, "|"), "native/evil.so", 0) >= 0, "strict flags the unlisted file")
+end
+
+#[test]
+fn open_rejects_garbage_and_duplicates() is
+    match hlib_archive::open_bytes(bs("definitely not an archive"), "x", hlib_limits::default_limits()) is
+        option::Result::Ok(_) => is test::fail("garbage") end
+        option::Result::Err(e) => is ck(e.code == "not_archive", "not_archive") end
+    end
+    let es: [hlib_tar::Entry] = [hlib_tar::Entry { path: "manifest.json", data: bs("x") }, hlib_tar::Entry { path: "manifest.json", data: bs("y") }]
+    let t: hlib_bytes::Buf = match hlib_tar::write(es, 0) is
+        option::Result::Ok(x) => is x end
+        option::Result::Err(e) => is hlib_bytes::buf_new(0) end
+    end
+    let c: hlib_bytes::Buf = match hlib_zstd::compress(t, 3) is
+        option::Result::Ok(x) => is x end
+        option::Result::Err(e) => is hlib_bytes::buf_new(0) end
+    end
+    match hlib_archive::open_bytes(c, "dup", hlib_limits::default_limits()) is
+        option::Result::Ok(_) => is test::fail("duplicates") end
+        option::Result::Err(e) => is ck(e.code == "duplicate_path", "duplicate_path") end
+    end
+end
+
+#[test]
+fn builder_validation_and_extract() is
+    match hlib_build::builder_new("../evil", "1", "hsharp") is
+        option::Result::Ok(_) => is test::fail("bad name") end
+        option::Result::Err(e) => is ck(e.code == "invalid_input", "bad name code") end
+    end
+    match hlib_build::builder_new("ok", "1", "klingon") is
+        option::Result::Ok(_) => is test::fail("bad language") end
+        option::Result::Err(e) => is ck(e.code == "unknown_language", "language code") end
+    end
+    let b: hlib_build::Builder = mk_builder()
+    match hlib_build::add_extra(b, "LICENSE", bs("again")) is
+        option::Result::Ok(_) => is test::fail("duplicate") end
+        option::Result::Err(e) => is ck(e.code == "duplicate_path", "dup code") end
+    end
+    match hlib_build::add_extra(b, "../../etc/x", bs("x")) is
+        option::Result::Ok(_) => is test::fail("traversal") end
+        option::Result::Err(e) => is ck(e.code == "unsafe_path", "unsafe code") end
+    end
+    let dir: string = "/tmp/hlib_t_extract_" + to_string(os::pid())
+    let a: hlib_archive::Archive = opened(built("").archive)
+    match hlib_archive::extract_to_dir(a, dir) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is test::fail(e.message) end
+    end
+    ck(fs::read(dir + "/ast/demo.hcs") == "fun x() [ ]\n", "extracted content")
+    ck(fs::exists(dir + "/native/x86_64-unknown-linux-gnu/demo.so") && fs::exists(dir + "/manifest.json"), "extracted tree")
+    fs::rmdir_all(dir)
+end
