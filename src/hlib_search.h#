@@ -1,0 +1,95 @@
+use "std -> option" from "option"
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+
+mod hlib_error
+mod hlib_bytes
+mod hlib_manifest
+
+pub fn language_dir(language: string) -> string is
+    if language == "hackerlang" is return "Hacker-Lang" end
+    if language == "hackerscript" is return "HackerScript" end
+    return "H#"
+end
+
+fn join_path(a: string, b: string) -> string is
+    if a == "" is return b end
+    if hlib_bytes::ends_with(a, "/") is return a + b end
+    return a + "/" + b
+end
+
+;; "a/b/c" -> ["a/b/c", "a/b", "a", ""]-ish chain of directories up to the root (absolute paths stop at "/")
+fn ancestors(dir: string) -> [string] is
+    let mut out: [string] = []
+    let mut d: string = dir
+    while d != "" is
+        out.push(d)
+        let p: string = hlib_bytes::parent_dir(d)
+        if p == d is break end
+        d = p
+    end
+    if hlib_bytes::starts_with(dir, "/") is out.push("/") end
+    return out
+end
+
+fn file_names(name: string, version: string) -> [string] is
+    if version != "" is return [name + "-" + version + ".hlib", name + ".hlib"] end
+    return [name + ".hlib"]
+end
+
+fn subdirs(dir: string) -> [string] is
+    if !fs::is_dir(dir) is return [] end
+    let mut out: [string] = []
+    for n in fs::list_dir(dir) is
+        let base: string = hlib_bytes::base_name(n)
+        if base != "" && base != "." && base != ".." is out.push(join_path(dir, base)) end
+    end
+    return out
+end
+
+;; Every directory that may hold `<name>.hlib`, in priority order.
+pub fn search_dirs(language: string, start_dir: string, name: string) -> [string] is
+    let mut dirs: [string] = []
+    for a in ancestors(start_dir) is dirs.push(join_path(a, "hlibs")) end
+    let home: string = env::get("HOME")
+    let mut roots: [string] = [join_path(start_dir, "cache/libs")]
+    let bh: string = env::get("BIT_HOME")
+    if bh != "" is
+        roots.push(join_path(bh, "libs"))
+        roots.push(bh)
+    end
+    if home != "" is roots.push(join_path(home, ".hackeros/libs")) end
+    if hlib_manifest::valid_name(name) is
+        for r in roots is
+            let base: string = join_path(r, name)
+            dirs.push(join_path(base, "current/.bit/out"))
+            dirs.push(join_path(base, "current"))
+            dirs.push(join_path(base, ".bit/out"))
+            dirs.push(base)
+            for id in subdirs(base) is
+                dirs.push(join_path(id, ".bit/out"))
+                dirs.push(id)
+            end
+        end
+    end
+    let ld: string = language_dir(language)
+    if home != "" is dirs.push(join_path(home, ".hackeros/" + ld + "/hlibs")) end
+    dirs.push("/usr/lib/HackerOS/" + ld + "/hlibs")
+    return dirs
+end
+
+;; The path of `<name>.hlib` (or `<name>-<version>.hlib`), or Err(not_found) naming every place tried.
+pub fn find(name: string, version: string, language: string, start_dir: string) -> option::Result<string, hlib_error::HlibError> is
+    if !hlib_manifest::valid_name(name) is
+        return option::Result::Err(hlib_error::invalid("invalid library name `" + name + "`"))
+    end
+    let mut tried: [string] = []
+    for d in search_dirs(language, start_dir, name) is
+        for f in file_names(name, version) is
+            let p: string = join_path(d, f)
+            if fs::is_file(p) is return option::Result::Ok(p) end
+            tried.push("  " + p)
+        end
+    end
+    return option::Result::Err(hlib_error::not_found("hlib '" + name + "' not found. Tried:\n" + hlib_bytes::join(tried, "\n")))
+end
