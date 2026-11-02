@@ -1,0 +1,413 @@
+use "std -> option" from "option"
+use "std -> strbuf" from "strbuf"
+
+mod hlib_error
+mod hlib_bytes
+mod hlib_json
+mod hlib_limits
+
+pub fn spec_version() -> int is return 1 end
+pub fn supported_editions() -> [string] is return ["2026"] end
+
+pub struct Artifact is
+    pub path: string
+    pub kind: string          ;; shared_object | bytecode | ast | header | extra
+    pub target: string        ;; "" = none
+    pub sha256: string
+    pub size: int
+end
+
+;; AbiType as text: "i8".."u64", "f32", "f64", "bool", "void", "ptr" or "opaque:<StructName>"
+pub struct Export is
+    pub name: string
+    pub kind: string          ;; function | struct | enum | trait | const | type_alias
+    pub signature: string
+    pub params: [string]
+    pub returns: string       ;; "" = none
+    pub generic: bool
+    pub is_macro: bool
+end
+
+pub struct Dependency is
+    pub name: string
+    pub version_req: string
+end
+
+pub struct Manifest is
+    pub spec_version: int
+    pub name: string
+    pub version: string
+    pub language: string      ;; hsharp | hackerlang | hackerscript
+    pub language_version: string
+    pub edition: string       ;; "" when absent (non-H# archives)
+    pub abi_version: int
+    pub description: string
+    pub authors: [string]
+    pub created_at: string
+    pub dependencies: [Dependency]
+    pub artifacts: [Artifact]
+    pub exports: [Export]
+    pub signed: bool
+    pub sig_algorithm: string
+    pub sig_public_key: string
+    pub sig_entry: string
+end
+
+pub fn empty() -> Manifest is
+    return Manifest {
+        spec_version: spec_version(), name: "", version: "", language: "hsharp", language_version: "",
+        edition: "", abi_version: 1, description: "", authors: [], created_at: "",
+        dependencies: [], artifacts: [], exports: [], signed: false, sig_algorithm: "", sig_public_key: "", sig_entry: ""
+    }
+end
+
+;; ── vocab ─────────────────────────────────────────────────────────────────────
+
+;; canonical language id from any accepted spelling
+pub fn language_from_str(s: string) -> option::Result<string, hlib_error::HlibError> is
+    let l: string = hlib_bytes::lower(s)
+    if l == "hsharp" || l == "h#" || l == "h-sharp" is return option::Result::Ok("hsharp") end
+    if l == "hackerlang" || l == "hl" || l == "hacker-lang" is return option::Result::Ok("hackerlang") end
+    if l == "hackerscript" || l == "hcs" || l == "hs" || l == "hacker-script" is return option::Result::Ok("hackerscript") end
+    return option::Result::Err(hlib_error::make("unknown_language", "unknown target language `" + l + "` (expected one of: hsharp, hackerlang, hackerscript)"))
+end
+
+pub fn valid_kind(k: string) -> bool is
+    return k == "shared_object" || k == "bytecode" || k == "ast" || k == "header" || k == "extra"
+end
+
+fn valid_symbol_kind(k: string) -> bool is
+    return k == "function" || k == "struct" || k == "enum" || k == "trait" || k == "const" || k == "type_alias"
+end
+
+fn valid_abi(t: string) -> bool is
+    if t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32" || t == "u64" is return true end
+    if t == "f32" || t == "f64" || t == "bool" || t == "void" || t == "ptr" is return true end
+    return hlib_bytes::starts_with(t, "opaque:") && t.len() > 7
+end
+
+;; a library name: [A-Za-z0-9._+-]+, not starting with '.' or '-', at most 128 bytes
+pub fn valid_name(s: string) -> bool is
+    if s.len() == 0 || s.len() > 128 is return false end
+    let first: int = byte_at(s, 0)
+    if first == 46 || first == 45 is return false end
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        let ok: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 95 || c == 43 || c == 45
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn check_supported(m: Manifest) -> option::Result<bool, hlib_error::HlibError> is
+    if m.spec_version > spec_version() is
+        return option::Result::Err(hlib_error::make("unsupported_spec", "hlib spec version " + to_string(m.spec_version) + " is newer than the highest version this reader understands (" + to_string(spec_version()) + ")"))
+    end
+    if m.language == "hsharp" && m.edition != "" is
+        let mut found: bool = false
+        for e in supported_editions() is
+            if e == m.edition is found = true end
+        end
+        if !found is
+            return option::Result::Err(hlib_error::make("unsupported_edition", "hlib was written for H# edition \"" + m.edition + "\", which this reader doesn't support (supported: " + hlib_bytes::join(supported_editions(), ", ") + ") — upgrade, or rebuild the library with a supported edition"))
+        end
+    end
+    return option::Result::Ok(true)
+end
+
+;; ── writer ────────────────────────────────────────────────────────────────────
+
+fn abi_json(t: string, lv: int) -> string is
+    let lb: string = hlib_json::lbrace()
+    let rb: string = hlib_json::rbrace()
+    if hlib_bytes::starts_with(t, "opaque:") is
+        return lb + "\n" + hlib_json::pad(lv + 1) + "\"type\": \"opaque\",\n" + hlib_json::pad(lv + 1) + "\"struct_name\": " + hlib_json::quote(t[7..t.len()]) + "\n" + hlib_json::pad(lv) + rb
+    end
+    return lb + "\n" + hlib_json::pad(lv + 1) + "\"type\": " + hlib_json::quote(t) + "\n" + hlib_json::pad(lv) + rb
+end
+
+pub fn export_json(e: Export, lv: int) -> string is
+    let mut f: [string] = []
+    f.push(hlib_json::pad(lv + 1) + "\"name\": " + hlib_json::quote(e.name))
+    f.push(hlib_json::pad(lv + 1) + "\"kind\": " + hlib_json::quote(e.kind))
+    f.push(hlib_json::pad(lv + 1) + "\"signature\": " + hlib_json::quote(e.signature))
+    if e.params.len() == 0 is
+        f.push(hlib_json::pad(lv + 1) + "\"params\": []")
+    else
+        let mut ps: [string] = []
+        for p in e.params is ps.push(hlib_json::pad(lv + 2) + abi_json(p, lv + 2)) end
+        f.push(hlib_json::pad(lv + 1) + "\"params\": [\n" + hlib_bytes::join(ps, ",\n") + "\n" + hlib_json::pad(lv + 1) + "]")
+    end
+    if e.returns.len() > 0 is f.push(hlib_json::pad(lv + 1) + "\"returns\": " + abi_json(e.returns, lv + 1)) end
+    f.push(hlib_json::pad(lv + 1) + "\"generic\": " + (if e.generic is "true" else "false" end))
+    f.push(hlib_json::pad(lv + 1) + "\"is_macro\": " + (if e.is_macro is "true" else "false" end))
+    return hlib_json::lbrace() + "\n" + hlib_bytes::join(f, ",\n") + "\n" + hlib_json::pad(lv) + hlib_json::rbrace()
+end
+
+pub fn exports_json(exports: [Export]) -> string is
+    if exports.len() == 0 is return "[]" end
+    let mut items: [string] = []
+    for e in exports is items.push(hlib_json::pad(1) + export_json(e, 1)) end
+    return "[\n" + hlib_bytes::join(items, ",\n") + "\n]"
+end
+
+fn artifact_json(a: Artifact, lv: int) -> string is
+    let mut f: [string] = []
+    f.push(hlib_json::pad(lv + 1) + "\"path\": " + hlib_json::quote(a.path))
+    f.push(hlib_json::pad(lv + 1) + "\"kind\": " + hlib_json::quote(a.kind))
+    if a.target.len() > 0 is f.push(hlib_json::pad(lv + 1) + "\"target\": " + hlib_json::quote(a.target)) end
+    f.push(hlib_json::pad(lv + 1) + "\"sha256\": " + hlib_json::quote(a.sha256))
+    f.push(hlib_json::pad(lv + 1) + "\"size\": " + to_string(a.size))
+    return hlib_json::lbrace() + "\n" + hlib_bytes::join(f, ",\n") + "\n" + hlib_json::pad(lv) + hlib_json::rbrace()
+end
+
+pub fn to_json(m: Manifest) -> string is
+    let lb: string = hlib_json::lbrace()
+    let rb: string = hlib_json::rbrace()
+    let mut f: [string] = []
+    f.push("  \"hlib_spec_version\": " + to_string(m.spec_version))
+    f.push("  \"name\": " + hlib_json::quote(m.name))
+    f.push("  \"version\": " + hlib_json::quote(m.version))
+    f.push("  \"language\": " + hlib_json::quote(m.language))
+    f.push("  \"language_version\": " + hlib_json::quote(m.language_version))
+    if m.edition != "" is f.push("  \"edition\": " + hlib_json::quote(m.edition)) end
+    f.push("  \"abi_version\": " + to_string(m.abi_version))
+    f.push("  \"description\": " + hlib_json::quote(m.description))
+    if m.authors.len() == 0 is
+        f.push("  \"authors\": []")
+    else
+        let mut a: [string] = []
+        for x in m.authors is a.push("    " + hlib_json::quote(x)) end
+        f.push("  \"authors\": [\n" + hlib_bytes::join(a, ",\n") + "\n  ]")
+    end
+    f.push("  \"created_at\": " + hlib_json::quote(m.created_at))
+    if m.dependencies.len() == 0 is
+        f.push("  \"dependencies\": []")
+    else
+        let mut d: [string] = []
+        for x in m.dependencies is
+            d.push("    " + lb + "\n      \"name\": " + hlib_json::quote(x.name) + ",\n      \"version_req\": " + hlib_json::quote(x.version_req) + "\n    " + rb)
+        end
+        f.push("  \"dependencies\": [\n" + hlib_bytes::join(d, ",\n") + "\n  ]")
+    end
+    if m.artifacts.len() == 0 is
+        f.push("  \"artifacts\": []")
+    else
+        let mut a: [string] = []
+        for x in m.artifacts is a.push("    " + artifact_json(x, 2)) end
+        f.push("  \"artifacts\": [\n" + hlib_bytes::join(a, ",\n") + "\n  ]")
+    end
+    if m.exports.len() == 0 is
+        f.push("  \"exports\": []")
+    else
+        let mut e: [string] = []
+        for x in m.exports is e.push("    " + export_json(x, 2)) end
+        f.push("  \"exports\": [\n" + hlib_bytes::join(e, ",\n") + "\n  ]")
+    end
+    if m.signed is
+        f.push("  \"signature\": " + lb + "\n    \"algorithm\": " + hlib_json::quote(m.sig_algorithm) + ",\n    \"public_key\": " + hlib_json::quote(m.sig_public_key) + ",\n    \"signed_entry\": " + hlib_json::quote(m.sig_entry) + "\n  " + rb)
+    end
+    return lb + "\n" + hlib_bytes::join(f, ",\n") + "\n" + rb
+end
+
+;; ── parser ────────────────────────────────────────────────────────────────────
+
+fn bad(why: string) -> hlib_error::HlibError is
+    return hlib_error::manifest(why)
+end
+
+;; required string member
+fn req_str(d: hlib_json::JDoc, obj: int, key: string) -> option::Result<string, hlib_error::HlibError> is
+    let n: int = hlib_json::get(d, obj, key)
+    if n < 0 is return option::Result::Err(bad("missing field `" + key + "`")) end
+    if hlib_json::kind(d, n) != 3 is return option::Result::Err(bad("invalid type for `" + key + "`, expected a string")) end
+    return option::Result::Ok(hlib_json::str_of(d, n))
+end
+
+;; optional string member (absent or null = default)
+fn opt_str(d: hlib_json::JDoc, obj: int, key: string, dflt: string) -> option::Result<string, hlib_error::HlibError> is
+    let n: int = hlib_json::get(d, obj, key)
+    if n < 0 || hlib_json::kind(d, n) == 0 is return option::Result::Ok(dflt) end
+    if hlib_json::kind(d, n) != 3 is return option::Result::Err(bad("invalid type for `" + key + "`, expected a string")) end
+    return option::Result::Ok(hlib_json::str_of(d, n))
+end
+
+fn opt_uint(d: hlib_json::JDoc, obj: int, key: string, dflt: int) -> option::Result<int, hlib_error::HlibError> is
+    let n: int = hlib_json::get(d, obj, key)
+    if n < 0 is return option::Result::Ok(dflt) end
+    let v: int = hlib_json::uint_of(d, n)
+    if v < 0 is return option::Result::Err(bad("invalid value for `" + key + "`, expected a non-negative integer")) end
+    return option::Result::Ok(v)
+end
+
+fn opt_bool(d: hlib_json::JDoc, obj: int, key: string) -> option::Result<bool, hlib_error::HlibError> is
+    let n: int = hlib_json::get(d, obj, key)
+    if n < 0 is return option::Result::Ok(false) end
+    if hlib_json::kind(d, n) != 1 is return option::Result::Err(bad("invalid type for `" + key + "`, expected a boolean")) end
+    return option::Result::Ok(hlib_json::bool_of(d, n))
+end
+
+fn abi_of(d: hlib_json::JDoc, n: int) -> option::Result<string, hlib_error::HlibError> is
+    if hlib_json::kind(d, n) != 5 is return option::Result::Err(bad("an ABI type must be an object")) end
+    let t: string = req_str(d, n, "type")?
+    if t == "opaque" is
+        let sn: string = req_str(d, n, "struct_name")?
+        if sn.len() == 0 is return option::Result::Err(bad("opaque ABI type with an empty struct_name")) end
+        return option::Result::Ok("opaque:" + sn)
+    end
+    if !valid_abi(t) is return option::Result::Err(bad("unknown ABI type `" + t + "`")) end
+    return option::Result::Ok(t)
+end
+
+fn exports_from(d: hlib_json::JDoc, en: int) -> option::Result<[Export], hlib_error::HlibError> is
+    let mut exps: [Export] = []
+    if en >= 0 && hlib_json::kind(d, en) != 0 is
+        if hlib_json::kind(d, en) != 4 is return option::Result::Err(bad("`exports` must be an array")) end
+        let mut ec: int = d.nodes[en].first
+        while ec >= 0 is
+            if hlib_json::kind(d, ec) != 5 is return option::Result::Err(bad("an export must be an object")) end
+            let sk: string = req_str(d, ec, "kind")?
+            if !valid_symbol_kind(sk) is
+                return option::Result::Err(bad("unknown variant `" + sk + "`, expected one of `function`, `struct`, `enum`, `trait`, `const`, `type_alias`"))
+            end
+            let mut ps: [string] = []
+            let pn: int = hlib_json::get(d, ec, "params")
+            if pn >= 0 && hlib_json::kind(d, pn) != 0 is
+                if hlib_json::kind(d, pn) != 4 is return option::Result::Err(bad("`params` must be an array")) end
+                let mut pc: int = d.nodes[pn].first
+                while pc >= 0 is
+                    ps.push(abi_of(d, pc)?)
+                    pc = d.nodes[pc].next
+                end
+            end
+            let mut ret: string = ""
+            let rn: int = hlib_json::get(d, ec, "returns")
+            if rn >= 0 && hlib_json::kind(d, rn) != 0 is ret = abi_of(d, rn)? end
+            exps.push(Export {
+                name: req_str(d, ec, "name")?, kind: sk, signature: req_str(d, ec, "signature")?,
+                params: ps, returns: ret, generic: opt_bool(d, ec, "generic")?, is_macro: opt_bool(d, ec, "is_macro")?
+            })
+            ec = d.nodes[ec].next
+        end
+    end
+    return option::Result::Ok(exps)
+end
+
+;; Parses a standalone JSON array of exports (the `headers/<name>.iface.json` shape).
+pub fn parse_exports(raw: hlib_bytes::Buf, lim: hlib_limits::Limits) -> option::Result<[Export], hlib_error::HlibError> is
+    let mut d: hlib_json::JDoc = hlib_json::JDoc { nodes: [], root: -1 }
+    match hlib_json::parse(raw, lim.max_json_depth) is
+        option::Result::Ok(x) => is d = x end
+        option::Result::Err(e) => is return option::Result::Err(bad(e)) end
+    end
+    if hlib_json::kind(d, d.root) != 4 is return option::Result::Err(bad("an exports file must be a JSON array")) end
+    return exports_from(d, d.root)
+end
+
+;; Parses and validates manifest.json bytes.
+pub fn parse(raw: hlib_bytes::Buf, lim: hlib_limits::Limits) -> option::Result<Manifest, hlib_error::HlibError> is
+    if raw.n > lim.max_manifest_bytes is
+        return option::Result::Err(hlib_error::limit("manifest.json is " + to_string(raw.n) + " bytes (limit " + to_string(lim.max_manifest_bytes) + ")"))
+    end
+    let mut d: hlib_json::JDoc = hlib_json::JDoc { nodes: [], root: -1 }
+    match hlib_json::parse(raw, lim.max_json_depth) is
+        option::Result::Ok(x) => is d = x end
+        option::Result::Err(e) => is return option::Result::Err(bad(e)) end
+    end
+    let r: int = d.root
+    if hlib_json::kind(d, r) != 5 is return option::Result::Err(bad("the manifest must be a JSON object")) end
+
+    let spec_n: int = hlib_json::get(d, r, "hlib_spec_version")
+    if spec_n < 0 is return option::Result::Err(bad("missing field `hlib_spec_version`")) end
+    let spec: int = hlib_json::uint_of(d, spec_n)
+    if spec < 0 is return option::Result::Err(bad("invalid value for `hlib_spec_version`")) end
+    let name: string = req_str(d, r, "name")?
+    let version: string = req_str(d, r, "version")?
+    let lang_text: string = req_str(d, r, "language")?
+    let mut language: string = ""
+    match language_from_str(lang_text) is
+        option::Result::Ok(l) => is
+            if l != lang_text is
+                return option::Result::Err(bad("unknown variant `" + lang_text + "`, expected one of `hsharp`, `hackerlang`, `hackerscript`"))
+            end
+            language = l
+        end
+        option::Result::Err(_) => is
+            return option::Result::Err(bad("unknown variant `" + lang_text + "`, expected one of `hsharp`, `hackerlang`, `hackerscript`"))
+        end
+    end
+    let created: string = req_str(d, r, "created_at")?
+    let arts_n: int = hlib_json::get(d, r, "artifacts")
+    if arts_n < 0 is return option::Result::Err(bad("missing field `artifacts`")) end
+    if hlib_json::kind(d, arts_n) != 4 is return option::Result::Err(bad("`artifacts` must be an array")) end
+
+    let mut authors: [string] = []
+    let an: int = hlib_json::get(d, r, "authors")
+    if an >= 0 && hlib_json::kind(d, an) != 0 is
+        if hlib_json::kind(d, an) != 4 is return option::Result::Err(bad("`authors` must be an array")) end
+        let mut c: int = d.nodes[an].first
+        while c >= 0 is
+            if hlib_json::kind(d, c) != 3 is return option::Result::Err(bad("`authors` must contain strings")) end
+            authors.push(hlib_json::str_of(d, c))
+            c = d.nodes[c].next
+        end
+    end
+
+    let mut deps: [Dependency] = []
+    let dn: int = hlib_json::get(d, r, "dependencies")
+    if dn >= 0 && hlib_json::kind(d, dn) != 0 is
+        if hlib_json::kind(d, dn) != 4 is return option::Result::Err(bad("`dependencies` must be an array")) end
+        let mut c: int = d.nodes[dn].first
+        while c >= 0 is
+            if hlib_json::kind(d, c) != 5 is return option::Result::Err(bad("a dependency must be an object")) end
+            deps.push(Dependency { name: req_str(d, c, "name")?, version_req: req_str(d, c, "version_req")? })
+            c = d.nodes[c].next
+        end
+    end
+
+    let mut arts: [Artifact] = []
+    let mut c: int = d.nodes[arts_n].first
+    while c >= 0 is
+        if hlib_json::kind(d, c) != 5 is return option::Result::Err(bad("an artifact must be an object")) end
+        let kind: string = req_str(d, c, "kind")?
+        if !valid_kind(kind) is
+            return option::Result::Err(bad("unknown variant `" + kind + "`, expected one of `shared_object`, `bytecode`, `ast`, `header`, `extra`"))
+        end
+        let sz_n: int = hlib_json::get(d, c, "size")
+        let sz: int = hlib_json::uint_of(d, sz_n)
+        if sz < 0 is return option::Result::Err(bad("artifact `size` must be a non-negative integer")) end
+        arts.push(Artifact {
+            path: req_str(d, c, "path")?, kind: kind, target: opt_str(d, c, "target", "")?,
+            sha256: req_str(d, c, "sha256")?, size: sz
+        })
+        c = d.nodes[c].next
+    end
+
+    let en: int = hlib_json::get(d, r, "exports")
+    let exps: [Export] = exports_from(d, en)?
+
+    let mut signed: bool = false
+    let mut alg: string = ""
+    let mut pk: string = ""
+    let mut entry: string = ""
+    let sn: int = hlib_json::get(d, r, "signature")
+    if sn >= 0 && hlib_json::kind(d, sn) != 0 is
+        if hlib_json::kind(d, sn) != 5 is return option::Result::Err(bad("`signature` must be an object")) end
+        signed = true
+        alg = req_str(d, sn, "algorithm")?
+        pk = req_str(d, sn, "public_key")?
+        entry = req_str(d, sn, "signed_entry")?
+    end
+
+    let m: Manifest = Manifest {
+        spec_version: spec, name: name, version: version, language: language,
+        language_version: opt_str(d, r, "language_version", "")?, edition: opt_str(d, r, "edition", "")?,
+        abi_version: opt_uint(d, r, "abi_version", 1)?, description: opt_str(d, r, "description", "")?,
+        authors: authors, created_at: created, dependencies: deps, artifacts: arts, exports: exps,
+        signed: signed, sig_algorithm: alg, sig_public_key: pk, sig_entry: entry
+    }
+    check_supported(m)?
+    return option::Result::Ok(m)
+end
