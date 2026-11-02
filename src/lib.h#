@@ -1,1 +1,153 @@
+use "std -> option" from "option"
 
+mod hlib_error
+mod hlib_sys
+mod hlib_bytes
+mod hlib_limits
+mod hlib_crypto
+mod hlib_zstd
+mod hlib_tar
+mod hlib_json
+mod hlib_manifest
+mod hlib_archive
+mod hlib_build
+mod hlib_search
+mod hlib_cli
+mod hlib_tests
+
+pub let VERSION: string = "1.0.0"
+pub let SPEC_VERSION: int = 1
+
+pub fn version() -> string is return VERSION end
+pub fn spec_version() -> int is return SPEC_VERSION end
+
+;; ── reading ───────────────────────────────────────────────────────────────────
+
+pub fn default_limits() -> hlib_limits::Limits is
+    return hlib_limits::default_limits()
+end
+
+pub fn open(path: string) -> option::Result<hlib_archive::Archive, hlib_error::HlibError> is
+    return hlib_archive::open(path)
+end
+
+pub fn open_with(path: string, lim: hlib_limits::Limits) -> option::Result<hlib_archive::Archive, hlib_error::HlibError> is
+    return hlib_archive::open_with(path, lim)
+end
+
+pub fn open_bytes(data: hlib_bytes::Buf, display: string, lim: hlib_limits::Limits) -> option::Result<hlib_archive::Archive, hlib_error::HlibError> is
+    return hlib_archive::open_bytes(data, display, lim)
+end
+
+pub fn read_manifest_json(path: string) -> option::Result<string, hlib_error::HlibError> is
+    return hlib_archive::read_manifest_json(path)
+end
+
+pub fn manifest_json(m: hlib_manifest::Manifest) -> string is
+    return hlib_manifest::to_json(m)
+end
+
+pub fn has_entry(a: hlib_archive::Archive, path: string) -> bool is
+    return hlib_archive::has_entry(a, path)
+end
+
+pub fn entry_paths(a: hlib_archive::Archive) -> [string] is
+    return hlib_archive::entry_paths(a)
+end
+
+pub fn entry_bytes(a: hlib_archive::Archive, path: string) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    return hlib_archive::entry_bytes(a, path)
+end
+
+;; ── verifying ─────────────────────────────────────────────────────────────────
+
+;; compat level (what the Rust toolchains check)
+pub fn verify_checksums(a: hlib_archive::Archive) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_archive::verify_checksums(a)
+end
+
+pub fn verify_signature(a: hlib_archive::Archive, pubkey_hex: string) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_archive::verify_signature(a, pubkey_hex)
+end
+
+;; strict level — use this before loading anything from an archive
+pub fn check(a: hlib_archive::Archive, trusted_key_hex: string) -> hlib_archive::Report is
+    return hlib_archive::check(a, trusted_key_hex)
+end
+
+pub fn check_strict(a: hlib_archive::Archive, trusted_key_hex: string) -> option::Result<hlib_archive::Report, hlib_error::HlibError> is
+    return hlib_archive::check_strict(a, trusted_key_hex)
+end
+
+;; ── extracting ────────────────────────────────────────────────────────────────
+
+pub fn extract_to_dir(a: hlib_archive::Archive, dir: string) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_archive::extract_to_dir(a, dir)
+end
+
+pub fn extract_entry(a: hlib_archive::Archive, path: string, dest: string) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_archive::extract_entry(a, path, dest)
+end
+
+;; ── building ──────────────────────────────────────────────────────────────────
+
+pub fn builder_new(name: string, version: string, language: string) -> option::Result<hlib_build::Builder, hlib_error::HlibError> is
+    return hlib_build::builder_new(name, version, language)
+end
+
+pub fn add_shared_object(b: hlib_build::Builder, target: string, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_shared_object(b, target, data)
+end
+
+pub fn add_ast(b: hlib_build::Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_ast(b, data)
+end
+
+pub fn add_header(b: hlib_build::Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_header(b, data)
+end
+
+pub fn add_bytecode(b: hlib_build::Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_bytecode(b, data)
+end
+
+pub fn add_extra(b: hlib_build::Builder, rel_name: string, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_extra(b, rel_name, data)
+end
+
+pub fn add_file(b: hlib_build::Builder, rel_path: string, kind: string, target: string, file: string) -> option::Result<bool, hlib_error::HlibError> is
+    return hlib_build::add_file(b, rel_path, kind, target, file)
+end
+
+pub fn build_bytes(b: hlib_build::Builder, signing_key_hex: string) -> option::Result<hlib_build::Built, hlib_error::HlibError> is
+    return hlib_build::build_bytes(b, signing_key_hex)
+end
+
+pub fn finish(b: hlib_build::Builder, output_path: string, signing_key_hex: string) -> option::Result<hlib_manifest::Manifest, hlib_error::HlibError> is
+    return hlib_build::finish(b, output_path, signing_key_hex)
+end
+
+;; ── keys and hashes ───────────────────────────────────────────────────────────
+
+pub fn generate_keypair() -> hlib_crypto::KeyPair is
+    return hlib_crypto::generate_keypair()
+end
+
+pub fn public_key_hex(signing_hex: string) -> option::Result<string, hlib_error::HlibError> is
+    return hlib_crypto::public_key_hex(signing_hex)
+end
+
+pub fn sha256_hex(b: hlib_bytes::Buf) -> string is
+    return hlib_crypto::sha256_hex(b)
+end
+
+;; ── locating ──────────────────────────────────────────────────────────────────
+
+;; `language`: hsharp | hackerlang | hackerscript; `start_dir` = where the importing file lives
+pub fn find(name: string, version: string, language: string, start_dir: string) -> option::Result<string, hlib_error::HlibError> is
+    return hlib_search::find(name, version, language, start_dir)
+end
+
+pub fn search_dirs(language: string, start_dir: string, name: string) -> [string] is
+    return hlib_search::search_dirs(language, start_dir, name)
+end
