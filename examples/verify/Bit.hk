@@ -1,0 +1,11 @@
+[package]
+-> name        => hlib-verify-example
+-> version     => 0.1.0
+-> description => Opens a .hlib, runs the strict verification and prints the manifest
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[dependencies]
+-> hlib => newest
