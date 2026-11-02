@@ -1,0 +1,492 @@
+use "std -> option" from "option"
+use "std -> strbuf" from "strbuf"
+use "std -> fs" from "fs"
+use "std -> os" from "os"
+
+mod hlib_error
+mod hlib_sys
+
+pub struct Buf is
+    pub p: int
+    pub n: int
+end
+
+pub fn buf_new(n: int) -> Buf is
+    return Buf { p: hlib_sys::calloc(if n > 0 is n else 1 end, 1), n: n }
+end
+
+pub fn buf_free(b: Buf) is
+    if b.p != 0 is hlib_sys::free(b.p) end
+    b.p = 0
+    b.n = 0
+end
+
+@pointers
+pub fn buf_get(b: Buf, i: int) -> int is
+    return ptr_read_i8(b.p, i) & 255
+end
+
+@pointers
+pub fn buf_set(b: Buf, i: int, v: int) is
+    ptr_write_i8(b.p, i, v)
+end
+
+;; text -> bytes (the trailing NUL is not part of `n`)
+pub fn buf_from_str(s: string) -> Buf is
+    let n: int = s.len()
+    let b: Buf = buf_new(n + 1)
+    hlib_sys::strcpy(b.p, s)
+    return Buf { p: b.p, n: n }
+end
+
+;; bytes -> text. Stops at the first NUL (an H# string cannot hold one); use `buf_has_nul` to refuse
+;; such input instead of silently truncating.
+pub fn buf_to_str(b: Buf) -> string is
+    if b.n == 0 is return "" end
+    return hlib_sys::strndup(b.p, b.n)
+end
+
+@pointers
+pub fn buf_has_nul(b: Buf) -> bool is
+    let mut i: int = 0
+    while i < b.n is
+        if ptr_read_i8(b.p, i) == 0 is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn buf_slice(b: Buf, off: int, n: int) -> Buf is
+    let r: Buf = buf_new(n)
+    if n > 0 is hlib_sys::memcpy(r.p, b.p + off, n) end
+    return r
+end
+
+pub fn buf_copy(b: Buf) -> Buf is
+    return buf_slice(b, 0, b.n)
+end
+
+;; content equality (NOT constant-time; see `ct_eq` for secrets and digests)
+pub fn buf_eq(a: Buf, b: Buf) -> bool is
+    if a.n != b.n is return false end
+    if a.n == 0 is return true end
+    return hlib_sys::memcmp(a.p, b.p, a.n) == 0
+end
+
+;; constant-time equality for equal-length buffers (digests, signatures); false if the lengths differ
+pub fn ct_eq(a: Buf, b: Buf) -> bool is
+    if a.n != b.n is return false end
+    if a.n == 0 is return true end
+    return hlib_sys::sodium_memcmp(a.p, b.p, a.n) == 0
+end
+
+;; ── growable writer ───────────────────────────────────────────────────────────
+
+pub struct Writer is
+    pub p: int
+    pub n: int
+    pub cap: int
+end
+
+pub fn writer_new(cap: int) -> Writer is
+    let c: int = if cap < 64 is 64 else cap end
+    return Writer { p: hlib_sys::malloc(c), n: 0, cap: c }
+end
+
+fn writer_reserve(w: Writer, extra: int) is
+    if w.n + extra <= w.cap is return end
+    let mut c: int = w.cap
+    while c < w.n + extra is c = c * 2 end
+    w.p = hlib_sys::realloc(w.p, c)
+    w.cap = c
+end
+
+pub fn writer_push(w: Writer, src: int, n: int) is
+    if n <= 0 is return end
+    writer_reserve(w, n)
+    hlib_sys::memcpy(w.p + w.n, src, n)
+    w.n += n
+end
+
+pub fn writer_push_buf(w: Writer, b: Buf) is
+    writer_push(w, b.p, b.n)
+end
+
+;; `n` zero bytes
+pub fn writer_push_zeros(w: Writer, n: int) is
+    if n <= 0 is return end
+    writer_reserve(w, n)
+    hlib_sys::memset(w.p + w.n, 0, n)
+    w.n += n
+end
+
+;; the written bytes as a Buf that owns the block (the writer must not be used afterwards)
+pub fn writer_finish(w: Writer) -> Buf is
+    let b: Buf = Buf { p: w.p, n: w.n }
+    w.p = 0
+    w.n = 0
+    w.cap = 0
+    return b
+end
+
+;; ── hex ───────────────────────────────────────────────────────────────────────
+
+fn hex_digit(v: int) -> string is
+    if v < 10 is return str_from_byte(48 + v) end
+    return str_from_byte(87 + v)
+end
+
+pub fn hex_encode(b: Buf) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < b.n is
+        let v: int = buf_get(b, i)
+        sb.push(hex_digit(v / 16))
+        sb.push(hex_digit(v % 16))
+        i += 1
+    end
+    return sb.build()
+end
+
+fn hex_val(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 87 end
+    if c >= 65 && c <= 70 is return c - 55 end
+    return -1
+end
+
+fn quote_char(c: int) -> string is
+    return "'" + str_from_byte(c) + "'"
+end
+
+;; hex text -> bytes. Err carries the same wording as Rust's `hex::decode`.
+pub fn hex_decode(s: string) -> option::Result<Buf, string> is
+    let n: int = s.len()
+    if n % 2 != 0 is return option::Result::Err("Odd number of digits") end
+    let b: Buf = buf_new(n / 2)
+    let mut i: int = 0
+    while i < n / 2 is
+        let hi: int = hex_val(byte_at(s, 2 * i))
+        let lo: int = hex_val(byte_at(s, 2 * i + 1))
+        if hi < 0 is
+            buf_free(b)
+            return option::Result::Err("Invalid character " + quote_char(byte_at(s, 2 * i)) + " at position " + to_string(2 * i))
+        end
+        if lo < 0 is
+            buf_free(b)
+            return option::Result::Err("Invalid character " + quote_char(byte_at(s, 2 * i + 1)) + " at position " + to_string(2 * i + 1))
+        end
+        buf_set(b, i, hi * 16 + lo)
+        i += 1
+    end
+    return option::Result::Ok(b)
+end
+
+;; true for a lowercase-or-uppercase hex string of exactly `digits` characters
+pub fn is_hex(s: string, digits: int) -> bool is
+    if s.len() != digits is return false end
+    let mut i: int = 0
+    while i < digits is
+        if hex_val(byte_at(s, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; ── strings ───────────────────────────────────────────────────────────────────
+
+pub fn trim_ws(s: string) -> string is
+    let mut a: int = 0
+    let mut e: int = s.len()
+    while a < e && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 10 || byte_at(s, a) == 13) is a += 1 end
+    while e > a && (byte_at(s, e - 1) == 32 || byte_at(s, e - 1) == 9 || byte_at(s, e - 1) == 10 || byte_at(s, e - 1) == 13) is e -= 1 end
+    return s[a..e]
+end
+
+pub fn lower(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        sb.push(str_from_byte(if c >= 65 && c <= 90 is c + 32 else c end))
+        i += 1
+    end
+    return sb.build()
+end
+
+pub fn starts_with(s: string, prefix: string) -> bool is
+    if prefix.len() > s.len() is return false end
+    return s[0..prefix.len()] == prefix
+end
+
+pub fn ends_with(s: string, suffix: string) -> bool is
+    if suffix.len() > s.len() is return false end
+    return s[s.len() - suffix.len()..s.len()] == suffix
+end
+
+;; index of `needle` in `s` at or after `from`, or -1
+pub fn find_from(s: string, needle: string, from: int) -> int is
+    let n: int = s.len()
+    let m: int = needle.len()
+    if m == 0 is return from end
+    let mut i: int = from
+    while i + m <= n is
+        if byte_at(s, i) == byte_at(needle, 0) && s[i..i + m] == needle is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn join(parts: [string], sep: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < parts.len() is
+        if i > 0 is sb.push(sep) end
+        sb.push(parts[i])
+        i += 1
+    end
+    return sb.build()
+end
+
+;; byte-wise ordering, like Rust's `str::cmp`: -1, 0, 1
+pub fn cmp_str(a: string, b: string) -> int is
+    let la: int = a.len()
+    let lb: int = b.len()
+    let mut i: int = 0
+    while i < la && i < lb is
+        let x: int = byte_at(a, i)
+        let y: int = byte_at(b, i)
+        if x != y is return if x < y is -1 else 1 end end
+        i += 1
+    end
+    if la == lb is return 0 end
+    return if la < lb is -1 else 1 end
+end
+
+;; ── UTF-8 ─────────────────────────────────────────────────────────────────────
+
+;; strict validation (no overlong forms, no surrogates, nothing above U+10FFFF) of b[off .. off+len)
+@pointers
+pub fn utf8_valid(b: Buf, off: int, len: int) -> bool is
+    let stop: int = off + len
+    let mut i: int = off
+    while i < stop is
+        let c: int = ptr_read_i8(b.p, i) & 255
+        if c < 128 is
+            i += 1
+        elsif c >= 194 && c <= 223 is
+            if i + 1 >= stop is return false end
+            if (ptr_read_i8(b.p, i + 1) & 192) != 128 is return false end
+            i += 2
+        elsif c >= 224 && c <= 239 is
+            if i + 2 >= stop is return false end
+            let c1: int = ptr_read_i8(b.p, i + 1) & 255
+            let c2: int = ptr_read_i8(b.p, i + 2) & 255
+            if (c1 & 192) != 128 || (c2 & 192) != 128 is return false end
+            if c == 224 && c1 < 160 is return false end
+            if c == 237 && c1 > 159 is return false end
+            i += 3
+        elsif c >= 240 && c <= 244 is
+            if i + 3 >= stop is return false end
+            let c1: int = ptr_read_i8(b.p, i + 1) & 255
+            let c2: int = ptr_read_i8(b.p, i + 2) & 255
+            let c3: int = ptr_read_i8(b.p, i + 3) & 255
+            if (c1 & 192) != 128 || (c2 & 192) != 128 || (c3 & 192) != 128 is return false end
+            if c == 240 && c1 < 144 is return false end
+            if c == 244 && c1 > 143 is return false end
+            i += 4
+        else
+            return false
+        end
+    end
+    return true
+end
+
+;; code point -> UTF-8 text
+pub fn utf8_encode(cp: int) -> string is
+    if cp < 128 is return str_from_byte(cp) end
+    if cp < 2048 is return str_from_byte(192 | (cp >> 6)) + str_from_byte(128 | (cp & 63)) end
+    if cp < 65536 is
+        return str_from_byte(224 | (cp >> 12)) + str_from_byte(128 | ((cp >> 6) & 63)) + str_from_byte(128 | (cp & 63))
+    end
+    return str_from_byte(240 | (cp >> 18)) + str_from_byte(128 | ((cp >> 12) & 63)) + str_from_byte(128 | ((cp >> 6) & 63)) + str_from_byte(128 | (cp & 63))
+end
+
+;; ── files ─────────────────────────────────────────────────────────────────────
+
+;; Reads a whole regular file. `max` (> 0) bounds the size: a bigger file is refused before reading.
+pub fn read_file(path: string, max: int) -> option::Result<Buf, hlib_error::HlibError> is
+    if !fs::exists(path) is
+        return option::Result::Err(hlib_error::io(path, "No such file or directory (os error 2)"))
+    end
+    if fs::is_dir(path) is
+        return option::Result::Err(hlib_error::io(path, "Is a directory (os error 21)"))
+    end
+    let f: int = hlib_sys::fopen(path, "rb")
+    if f == 0 is
+        return option::Result::Err(hlib_error::io(path, "Permission denied (os error 13)"))
+    end
+    hlib_sys::fseek(f, 0, 2)
+    let n: int = hlib_sys::ftell(f)
+    hlib_sys::fseek(f, 0, 0)
+    if n < 0 is
+        hlib_sys::fclose(f)
+        return option::Result::Err(hlib_error::io(path, "cannot determine the file size"))
+    end
+    if max > 0 && n > max is
+        hlib_sys::fclose(f)
+        return option::Result::Err(hlib_error::limit("`" + path + "` is " + to_string(n) + " bytes (limit " + to_string(max) + ")"))
+    end
+    let b: Buf = buf_new(n)
+    let got: int = if n > 0 is hlib_sys::fread(b.p, 1, n, f) else 0 end
+    hlib_sys::fclose(f)
+    if got != n is
+        buf_free(b)
+        return option::Result::Err(hlib_error::io(path, "short read"))
+    end
+    return option::Result::Ok(b)
+end
+
+;; Writes `b` to `path` atomically: data goes to a sibling temporary file which is flushed, fsync'ed
+;; and renamed over `path`. A crash or a full disk never leaves a half-written file under `path`;
+;; a symlink at `path` is replaced, never followed.
+pub fn write_file(path: string, b: Buf) -> option::Result<bool, hlib_error::HlibError> is
+    let tmp: string = path + ".tmp" + to_string(hlib_sys::getpid())
+    let f: int = hlib_sys::fopen(tmp, "wb")
+    if f == 0 is
+        return option::Result::Err(hlib_error::io(path, "cannot create file"))
+    end
+    let put: int = if b.n > 0 is hlib_sys::fwrite(b.p, 1, b.n, f) else 0 end
+    let flushed: int = hlib_sys::fflush(f)
+    hlib_sys::fsync(hlib_sys::fileno(f))
+    let closed: int = hlib_sys::fclose(f)
+    if put != b.n || flushed != 0 || closed != 0 is
+        hlib_sys::remove(tmp)
+        return option::Result::Err(hlib_error::io(path, "short write (disk full?)"))
+    end
+    if hlib_sys::rename(tmp, path) != 0 is
+        hlib_sys::remove(tmp)
+        return option::Result::Err(hlib_error::io(path, "cannot rename the temporary file into place"))
+    end
+    return option::Result::Ok(true)
+end
+
+;; like `write_file`, then restricts the mode (0600 for secret keys)
+pub fn write_file_mode(path: string, b: Buf, mode: int) -> option::Result<bool, hlib_error::HlibError> is
+    let tmp: string = path + ".tmp" + to_string(hlib_sys::getpid())
+    let f: int = hlib_sys::fopen(tmp, "wb")
+    if f == 0 is
+        return option::Result::Err(hlib_error::io(path, "cannot create file"))
+    end
+    hlib_sys::chmod(tmp, mode)
+    let put: int = if b.n > 0 is hlib_sys::fwrite(b.p, 1, b.n, f) else 0 end
+    hlib_sys::fflush(f)
+    hlib_sys::fsync(hlib_sys::fileno(f))
+    let closed: int = hlib_sys::fclose(f)
+    if put != b.n || closed != 0 is
+        hlib_sys::remove(tmp)
+        return option::Result::Err(hlib_error::io(path, "short write (disk full?)"))
+    end
+    if hlib_sys::rename(tmp, path) != 0 is
+        hlib_sys::remove(tmp)
+        return option::Result::Err(hlib_error::io(path, "cannot rename the temporary file into place"))
+    end
+    return option::Result::Ok(true)
+end
+
+;; `mkdir -p`
+pub fn make_dirs(path: string) is
+    if path.len() == 0 || fs::is_dir(path) is return end
+    let mut i: int = 1
+    while i < path.len() is
+        if byte_at(path, i) == 47 is
+            let part: string = path[0..i]
+            if !fs::is_dir(part) is hlib_sys::mkdir(part, 493) end
+        end
+        i += 1
+    end
+    if !fs::is_dir(path) is hlib_sys::mkdir(path, 493) end
+end
+
+pub fn parent_dir(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 0 is
+        if byte_at(p, i) == 47 is return p[0..i] end
+        i -= 1
+    end
+    return ""
+end
+
+pub fn base_name(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 0 is
+        if byte_at(p, i) == 47 is return p[i + 1..p.len()] end
+        i -= 1
+    end
+    return p
+end
+
+;; ── sorting ───────────────────────────────────────────────────────────────────
+
+;; Indices 0..n of `keys` ordered by byte-wise key comparison (stable merge sort, O(n log n)).
+pub fn sort_order(keys: [string]) -> [int] is
+    let n: int = keys.len()
+    let mut a: [int] = []
+    let mut b: [int] = []
+    let mut i: int = 0
+    while i < n is
+        a.push(i)
+        b.push(0)
+        i += 1
+    end
+    let mut width: int = 1
+    while width < n is
+        let mut lo: int = 0
+        while lo < n is
+            let mid: int = if lo + width < n is lo + width else n end
+            let hi: int = if lo + 2 * width < n is lo + 2 * width else n end
+            let mut l: int = lo
+            let mut r: int = mid
+            let mut k: int = lo
+            while l < mid && r < hi is
+                if cmp_str(keys[a[r]], keys[a[l]]) < 0 is
+                    b[k] = a[r]
+                    r += 1
+                else
+                    b[k] = a[l]
+                    l += 1
+                end
+                k += 1
+            end
+            while l < mid is
+                b[k] = a[l]
+                l += 1
+                k += 1
+            end
+            while r < hi is
+                b[k] = a[r]
+                r += 1
+                k += 1
+            end
+            lo += 2 * width
+        end
+        let t: [int] = a
+        a = b
+        b = t
+        width = width * 2
+    end
+    return a
+end
+
+;; position in `keys` of `key` using the permutation from `sort_order(keys)`, or -1 (binary search)
+pub fn sorted_find(keys: [string], order: [int], key: string) -> int is
+    let mut lo: int = 0
+    let mut hi: int = order.len() - 1
+    while lo <= hi is
+        let mid: int = (lo + hi) / 2
+        let c: int = cmp_str(keys[order[mid]], key)
+        if c == 0 is return order[mid] end
+        if c < 0 is lo = mid + 1 else hi = mid - 1 end
+    end
+    return -1
+end
