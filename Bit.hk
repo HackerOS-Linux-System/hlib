@@ -1,1 +1,51 @@
+[package]
+-> name        => hlib
+-> version     => 0.0.1
+-> description => The .hlib archive format for H#, Hacker Lang and HackerScript — read, verify, build, sign, extract. One implementation in H#.
+-> authors     => ["HackerOS Team"]
+-> license     => GPL-3.0
+-> keywords    => ["hlib", "hlib-api", "archive", "ed25519", "zstd", "tar"]
+-> readme      => README.md
+-> lang        => h#
 
+[edition]
+-> edition   => 2026
+-> toolchain => 1.0
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[lib]
+-> output => hlib
+
+[default-build]
+-> profile => release
+-> emit    => bin
+
+[system-dependencies]
+-> libzstd
+--> apt => libzstd-dev
+--> dnf => libzstd-devel
+--> pacman => zstd
+--> header => zstd.h
+--> lib => zstd
+-> libsodium
+--> apt => libsodium-dev
+--> dnf => libsodium-devel
+--> pacman => libsodium
+--> header => sodium.h
+--> lib => sodium
+
+[commands]
+-> check
+--> run => h# check src/lib.h#
+--> description => Type-check the library
+-> unit
+--> run => h# test src/lib.h#
+--> description => Run the unit tests
+-> interop
+--> run => python3 tests/interop.py
+--> description => Cross-check against independent implementations (needs python3-zstandard, pynacl)
