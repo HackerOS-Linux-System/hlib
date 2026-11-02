@@ -1,0 +1,80 @@
+use "std -> option" from "option"
+
+pub struct HlibError is
+    pub code: string
+    pub message: string
+end
+
+pub fn make(code: string, message: string) -> HlibError is
+    return HlibError { code: code, message: message }
+end
+
+pub fn io(path: string, what: string) -> HlibError is
+    return HlibError { code: "io", message: "i/o error at " + path + ": " + what }
+end
+
+pub fn not_archive(path: string) -> HlibError is
+    return HlibError {
+        code: "not_archive",
+        message: "`" + path + "` is not a valid .hlib archive (not a zstd-compressed tar / bad header)"
+    }
+end
+
+pub fn missing_entry(path: string) -> HlibError is
+    return HlibError { code: "missing_entry", message: "archive is missing required entry `" + path + "`" }
+end
+
+pub fn checksum_mismatch(path: string, expected: string, actual: string) -> HlibError is
+    return HlibError {
+        code: "checksum_mismatch",
+        message: "archive entry `" + path + "` failed checksum verification (expected " + expected + ", got " + actual + ")"
+    }
+end
+
+pub fn malformed_checksums(line: string) -> HlibError is
+    return HlibError { code: "malformed_checksums", message: "CHECKSUMS.sha256 line is malformed: `" + line + "`" }
+end
+
+pub fn unsigned() -> HlibError is
+    return HlibError { code: "unsigned", message: "archive is not signed (no SIGNATURE.ed25519 entry) — cannot verify" }
+end
+
+pub fn bad_signature() -> HlibError is
+    return HlibError { code: "bad_signature", message: "ed25519 signature verification failed for this archive" }
+end
+
+pub fn bad_key(why: string) -> HlibError is
+    return HlibError { code: "bad_key", message: "invalid ed25519 key material: " + why }
+end
+
+pub fn duplicate_path(path: string) -> HlibError is
+    return HlibError { code: "duplicate_path", message: "duplicate archive entry path `" + path + "`" }
+end
+
+pub fn unsafe_path(path: string, why: string) -> HlibError is
+    return HlibError { code: "unsafe_path", message: "unsafe archive path `" + path + "`: " + why }
+end
+
+pub fn limit(what: string) -> HlibError is
+    return HlibError { code: "limit", message: "resource limit exceeded: " + what }
+end
+
+pub fn manifest(why: string) -> HlibError is
+    return HlibError { code: "manifest", message: "manifest (de)serialization failed: " + why }
+end
+
+pub fn tar(why: string) -> HlibError is
+    return HlibError { code: "tar", message: "malformed tar archive: " + why }
+end
+
+pub fn zstd(why: string) -> HlibError is
+    return HlibError { code: "zstd", message: "zstd: " + why }
+end
+
+pub fn invalid(why: string) -> HlibError is
+    return HlibError { code: "invalid_input", message: why }
+end
+
+pub fn not_found(why: string) -> HlibError is
+    return HlibError { code: "not_found", message: why }
+end
