@@ -1,0 +1,370 @@
+use "std -> option" from "option"
+
+mod hlib_error
+mod hlib_sys
+mod hlib_bytes
+mod hlib_limits
+
+pub struct Entry is
+    pub path: string
+    pub data: hlib_bytes::Buf
+end
+
+;; ── path safety ───────────────────────────────────────────────────────────────
+
+;; "" when `path` is a safe archive-relative path, otherwise the reason it is not.
+pub fn unsafe_reason(path: string) -> string is
+    let n: int = path.len()
+    if n == 0 is return "empty path" end
+    if n > 4096 is return "path longer than 4096 bytes" end
+    if byte_at(path, 0) == 47 is return "absolute path" end
+    if n >= 2 && byte_at(path, 1) == 58 is return "drive-letter path" end
+    let mut seg_start: int = 0
+    let mut i: int = 0
+    while i <= n is
+        let c: int = if i < n is byte_at(path, i) else 47 end
+        if i < n && c == 92 is return "backslash in path" end
+        if i < n && (c < 32 || c == 127) is return "control character in path" end
+        if c == 47 is
+            let seg: string = path[seg_start..i]
+            if seg.len() == 0 && i < n is return "empty path segment" end
+            if seg == ".." is return "`..` path segment" end
+            if seg == "." is return "`.` path segment" end
+            seg_start = i + 1
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; strips leading "./" (what `tar -cf x .` produces)
+pub fn normalize_path(p: string) -> string is
+    let mut s: string = p
+    while s.len() >= 2 && byte_at(s, 0) == 46 && byte_at(s, 1) == 47 is
+        s = s[2..s.len()]
+    end
+    return s
+end
+
+;; ── writer ────────────────────────────────────────────────────────────────────
+
+fn octal(v: int, width: int) -> string is
+    let mut digits: string = ""
+    let mut x: int = v
+    if x == 0 is digits = "0" end
+    while x > 0 is
+        digits = str_from_byte(48 + x % 8) + digits
+        x = x / 8
+    end
+    while digits.len() < width is digits = "0" + digits end
+    return digits
+end
+
+fn pad512(n: int) -> int is
+    return ((n + 511) / 512) * 512
+end
+
+;; one 512-byte header. `name` is truncated to 100 bytes (long names are carried by a preceding `L` record).
+@pointers
+fn header(name: string, size: int, typeflag: int, mode: int) -> hlib_bytes::Buf is
+    let h: hlib_bytes::Buf = hlib_bytes::buf_new(512)
+    let shown: string = if name.len() > 100 is name[0..100] else name end
+    hlib_sys::strcpy(h.p, shown)
+    hlib_sys::strcpy(h.p + 100, octal(mode, 7))
+    hlib_sys::strcpy(h.p + 108, octal(0, 7))             ;; uid
+    hlib_sys::strcpy(h.p + 116, octal(0, 7))             ;; gid
+    hlib_sys::strcpy(h.p + 124, octal(size, 11))
+    hlib_sys::strcpy(h.p + 136, octal(0, 11))            ;; mtime 0
+    let mut i: int = 148
+    while i < 156 is
+        ptr_write_i8(h.p, i, 32)
+        i += 1
+    end
+    ptr_write_i8(h.p, 156, typeflag)
+    hlib_sys::strcpy(h.p + 257, "ustar ")                ;; GNU magic "ustar  \0"
+    ptr_write_i8(h.p, 263, 32)
+    ptr_write_i8(h.p, 264, 0)
+    let mut sum: int = 0
+    i = 0
+    while i < 512 is
+        sum += ptr_read_i8(h.p, i) & 255
+        i += 1
+    end
+    hlib_sys::strcpy(h.p + 148, octal(sum, 6))           ;; "dddddd\0" then the space already there
+    ptr_write_i8(h.p, 154, 0)
+    ptr_write_i8(h.p, 155, 32)
+    return h
+end
+
+;; Serialises `entries` into a tar stream (two zero blocks at the end).
+pub fn write(entries: [Entry], max_total: int) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    let mut total: int = 1024
+    for e in entries is
+        let reason: string = unsafe_reason(e.path)
+        if reason != "" is return option::Result::Err(hlib_error::unsafe_path(e.path, reason)) end
+        if e.data.n > 8589934591 is
+            return option::Result::Err(hlib_error::limit("entry `" + e.path + "` is larger than a tar header can describe (8 GiB)"))
+        end
+        total += 512 + pad512(e.data.n)
+        if e.path.len() > 100 is total += 512 + pad512(e.path.len() + 1) end
+    end
+    if max_total > 0 && total > max_total is
+        return option::Result::Err(hlib_error::limit("archive would be " + to_string(total) + " bytes unpacked (limit " + to_string(max_total) + ")"))
+    end
+    let w: hlib_bytes::Writer = hlib_bytes::writer_new(total)
+    for e in entries is
+        if e.path.len() > 100 is
+            let lh: hlib_bytes::Buf = header("././@LongLink", e.path.len() + 1, 76, 0)
+            hlib_bytes::writer_push_buf(w, lh)
+            hlib_bytes::buf_free(lh)
+            let nm: hlib_bytes::Buf = hlib_bytes::buf_from_str(e.path)
+            hlib_bytes::writer_push(w, nm.p, nm.n)
+            hlib_bytes::writer_push_zeros(w, pad512(e.path.len() + 1) - nm.n)
+            hlib_bytes::buf_free(nm)
+        end
+        let h: hlib_bytes::Buf = header(e.path, e.data.n, 48, 420)
+        hlib_bytes::writer_push_buf(w, h)
+        hlib_bytes::buf_free(h)
+        hlib_bytes::writer_push_buf(w, e.data)
+        hlib_bytes::writer_push_zeros(w, pad512(e.data.n) - e.data.n)
+    end
+    hlib_bytes::writer_push_zeros(w, 1024)
+    return option::Result::Ok(hlib_bytes::writer_finish(w))
+end
+
+;; ── reader ────────────────────────────────────────────────────────────────────
+
+@pointers
+fn block_is_zero(b: hlib_bytes::Buf, off: int) -> bool is
+    let mut i: int = 0
+    while i < 512 is
+        if ptr_read_i8(b.p, off + i) != 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; octal field (NUL / space terminated, leading spaces allowed); -1 when it holds anything else
+@pointers
+fn parse_octal(b: hlib_bytes::Buf, off: int, len: int) -> int is
+    let mut v: int = 0
+    let mut i: int = 0
+    let mut seen: bool = false
+    while i < len is
+        let c: int = ptr_read_i8(b.p, off + i) & 255
+        if c >= 48 && c <= 55 is
+            v = v * 8 + (c - 48)
+            seen = true
+            if v > 36028797018963967 is return -1 end
+        elsif c == 0 || c == 32 is
+            if seen || c == 0 is break end
+        else
+            return -1
+        end
+        i += 1
+    end
+    if !seen is return 0 end
+    return v
+end
+
+;; size field: octal, or GNU base-256 (high bit of the first byte set)
+@pointers
+fn parse_size(b: hlib_bytes::Buf, off: int) -> int is
+    let first: int = ptr_read_i8(b.p, off) & 255
+    if (first & 128) == 0 is return parse_octal(b, off, 12) end
+    if (first & 64) != 0 is return -1 end                 ;; negative
+    let mut v: int = first & 63
+    let mut i: int = 1
+    while i < 12 is
+        if v > 36028797018963967 is return -1 end
+        v = v * 256 + (ptr_read_i8(b.p, off + i) & 255)
+        i += 1
+    end
+    return v
+end
+
+;; the NUL-terminated text of b[off .. off+max) (at most `max` bytes)
+@pointers
+fn cstr(b: hlib_bytes::Buf, off: int, max: int) -> string is
+    let mut n: int = 0
+    while n < max && ptr_read_i8(b.p, off + n) != 0 is n += 1 end
+    if n == 0 is return "" end
+    return hlib_sys::strndup(b.p + off, n)
+end
+
+@pointers
+fn header_checksum_ok(b: hlib_bytes::Buf, off: int) -> bool is
+    let stored: int = parse_octal(b, off + 148, 8)
+    if stored < 0 is return false end
+    let mut sum: int = 0
+    let mut i: int = 0
+    while i < 512 is
+        if i >= 148 && i < 156 is sum += 32 else sum += ptr_read_i8(b.p, off + i) & 255 end
+        i += 1
+    end
+    return sum == stored
+end
+
+;; POSIX ustar ("ustar\0" + "00") — only then bytes 345.. are a path prefix (GNU headers reuse them for times)
+@pointers
+fn is_posix_ustar(b: hlib_bytes::Buf, off: int) -> bool is
+    return ptr_read_i8(b.p, off + 257) == 117 && ptr_read_i8(b.p, off + 258) == 115 && ptr_read_i8(b.p, off + 259) == 116 &&
+           ptr_read_i8(b.p, off + 260) == 97 && ptr_read_i8(b.p, off + 261) == 114 && ptr_read_i8(b.p, off + 262) == 0 &&
+           ptr_read_i8(b.p, off + 263) == 48 && ptr_read_i8(b.p, off + 264) == 48
+end
+
+@pointers
+fn has_ustar_magic(b: hlib_bytes::Buf, off: int) -> bool is
+    return ptr_read_i8(b.p, off + 257) == 117 && ptr_read_i8(b.p, off + 258) == 115 && ptr_read_i8(b.p, off + 259) == 116 &&
+           ptr_read_i8(b.p, off + 260) == 97 && ptr_read_i8(b.p, off + 261) == 114
+end
+
+;; "<len> <key>=<value>\n" records of a PAX extended header: the value of `key`, or "" when absent
+@pointers
+fn pax_value(b: hlib_bytes::Buf, off: int, size: int, key: string) -> string is
+    let mut i: int = 0
+    while i < size is
+        let mut len: int = 0
+        let mut digits: int = 0
+        while i < size && (ptr_read_i8(b.p, off + i) & 255) >= 48 && (ptr_read_i8(b.p, off + i) & 255) <= 57 is
+            len = len * 10 + ((ptr_read_i8(b.p, off + i) & 255) - 48)
+            digits += 1
+            i += 1
+            if len > size is return "" end
+        end
+        if digits == 0 || len < digits + 3 || i >= size is return "" end
+        let rec_start: int = i - digits
+        if rec_start + len > size is return "" end
+        ;; i is at the space after the length
+        let body_start: int = i + 1
+        let body_end: int = rec_start + len - 1          ;; before the trailing newline
+        if body_end < body_start is return "" end
+        let rec: string = hlib_sys::strndup(b.p + off + body_start, body_end - body_start)
+        let eq: int = hlib_bytes::find_from(rec, "=", 0)
+        if eq > 0 && rec[0..eq] == key is return rec[eq + 1..rec.len()] end
+        i = rec_start + len
+    end
+    return ""
+end
+
+fn parse_decimal(s: string) -> int is
+    if s.len() == 0 || s.len() > 18 is return -1 end
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return -1 end
+        v = v * 10 + (c - 48)
+        i += 1
+    end
+    return v
+end
+
+;; Parses a whole (decompressed) tar stream into its regular-file entries.
+@pointers
+pub fn read(tar: hlib_bytes::Buf, lim: hlib_limits::Limits) -> option::Result<[Entry], hlib_error::HlibError> is
+    let mut out: [Entry] = []
+    let mut off: int = 0
+    let mut long_name: string = ""
+    let mut pax_path: string = ""
+    let mut pax_size: int = -1
+    let mut total: int = 0
+    let mut ended: bool = false
+    while off + 512 <= tar.n is
+        if block_is_zero(tar, off) is
+            ended = true
+            break
+        end
+        if !header_checksum_ok(tar, off) is
+            return option::Result::Err(hlib_error::tar("bad header checksum at offset " + to_string(off)))
+        end
+        if !has_ustar_magic(tar, off) is
+            return option::Result::Err(hlib_error::tar("not a ustar/GNU/PAX header at offset " + to_string(off)))
+        end
+        let mut size: int = parse_size(tar, off + 124)
+        if size < 0 is
+            return option::Result::Err(hlib_error::tar("bad size field at offset " + to_string(off)))
+        end
+        let flag: int = ptr_read_i8(tar.p, off + 156) & 255
+        let body: int = off + 512
+        if flag == 120 && size > 1048576 is
+            return option::Result::Err(hlib_error::limit("PAX header larger than 1 MiB"))
+        end
+        if flag == 76 && size > 8192 is
+            return option::Result::Err(hlib_error::limit("GNU long-name record larger than 8 KiB"))
+        end
+        let is_data: bool = flag == 48 || flag == 0 || flag == 55
+        if is_data && pax_size >= 0 is size = pax_size end
+        if body + size > tar.n || body + size < body is
+            return option::Result::Err(hlib_error::tar("entry at offset " + to_string(off) + " is truncated"))
+        end
+        if flag == 76 is
+            long_name = cstr(tar, body, size)
+        elsif flag == 75 || flag == 103 is
+            ;; GNU long link target / PAX global header: nothing a library archive needs
+        elsif flag == 120 is
+            pax_path = pax_value(tar, body, size, "path")
+            let ps: string = pax_value(tar, body, size, "size")
+            if ps != "" is
+                pax_size = parse_decimal(ps)
+                if pax_size < 0 is return option::Result::Err(hlib_error::tar("bad PAX size record")) end
+            end
+        elsif flag == 53 is
+            long_name = ""
+            pax_path = ""
+            pax_size = -1
+        elsif is_data is
+            let mut name: string = cstr(tar, off, 100)
+            if is_posix_ustar(tar, off) is
+                let prefix: string = cstr(tar, off + 345, 155)
+                if prefix != "" is name = prefix + "/" + name end
+            end
+            if pax_path != "" is
+                name = pax_path
+            elsif long_name != "" is
+                name = long_name
+            end
+            long_name = ""
+            pax_path = ""
+            pax_size = -1
+            let path: string = normalize_path(name)
+            if hlib_bytes::ends_with(path, "/") is
+                ;; a directory record written as a file with a trailing slash: skipped
+            else
+                let reason: string = unsafe_reason(path)
+                if reason != "" is return option::Result::Err(hlib_error::unsafe_path(path, reason)) end
+                let pb: hlib_bytes::Buf = hlib_bytes::buf_from_str(path)
+                let utf8_ok: bool = hlib_bytes::utf8_valid(pb, 0, pb.n)
+                hlib_bytes::buf_free(pb)
+                if !utf8_ok is return option::Result::Err(hlib_error::unsafe_path(path, "path is not valid UTF-8")) end
+                if out.len() >= lim.max_entries is
+                    return option::Result::Err(hlib_error::limit("more than " + to_string(lim.max_entries) + " entries"))
+                end
+                if size > lim.max_entry_bytes is
+                    return option::Result::Err(hlib_error::limit("entry `" + path + "` is " + to_string(size) + " bytes (limit " + to_string(lim.max_entry_bytes) + ")"))
+                end
+                total += size
+                if total > lim.max_unpacked_bytes is
+                    return option::Result::Err(hlib_error::limit("unpacked size exceeds " + to_string(lim.max_unpacked_bytes) + " bytes"))
+                end
+                out.push(Entry { path: path, data: hlib_bytes::buf_slice(tar, body, size) })
+            end
+        elsif flag == 49 || flag == 50 is
+            return option::Result::Err(hlib_error::tar("entry at offset " + to_string(off) + " is a " + (if flag == 49 is "hard link" else "symbolic link" end) + " — links are not allowed in a .hlib"))
+        else
+            return option::Result::Err(hlib_error::tar("entry at offset " + to_string(off) + " has unsupported type flag " + to_string(flag)))
+        end
+        off = body + pad512(size)
+    end
+    if !ended && off < tar.n is
+        ;; leftover bytes that are not a full block: only zero padding is tolerated
+        let mut k: int = off
+        while k < tar.n is
+            if ptr_read_i8(tar.p, k) != 0 is
+                return option::Result::Err(hlib_error::tar("trailing data after the last entry"))
+            end
+            k += 1
+        end
+    end
+    return option::Result::Ok(out)
+end
