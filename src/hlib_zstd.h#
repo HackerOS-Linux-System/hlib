@@ -1,0 +1,81 @@
+use "std -> option" from "option"
+
+mod hlib_error
+mod hlib_sys
+mod hlib_bytes
+
+pub fn default_level() -> int is return 19 end
+
+;; level is clamped to 1 ..= ZSTD_maxCLevel()
+pub fn compress(src: hlib_bytes::Buf, level: int) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    let mut lv: int = level
+    let top: int = hlib_sys::ZSTD_maxCLevel()
+    if lv < 1 is lv = 1 end
+    if lv > top is lv = top end
+    let cap: int = hlib_sys::ZSTD_compressBound(src.n)
+    let dst: hlib_bytes::Buf = hlib_bytes::buf_new(cap)
+    let c: int = hlib_sys::ZSTD_compress(dst.p, cap, src.p, src.n, lv)
+    if hlib_sys::ZSTD_isError(c) != 0 is
+        hlib_bytes::buf_free(dst)
+        return option::Result::Err(hlib_error::zstd("compression failed"))
+    end
+    return option::Result::Ok(hlib_bytes::Buf { p: dst.p, n: c })
+end
+
+;; Decompresses every frame of `src`. `max_out` (> 0) is the largest result accepted.
+@pointers
+pub fn decompress(src: hlib_bytes::Buf, max_out: int) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    if src.n == 0 is return option::Result::Err(hlib_error::zstd("empty input")) end
+    let ds: int = hlib_sys::ZSTD_createDStream()
+    if ds == 0 is return option::Result::Err(hlib_error::zstd("cannot allocate a decompression stream")) end
+    hlib_sys::ZSTD_initDStream(ds)
+    let inb: int = hlib_sys::calloc(3, 8)          ;; ZSTD_inBuffer  { src, size, pos }
+    let outb: int = hlib_sys::calloc(3, 8)         ;; ZSTD_outBuffer { dst, size, pos }
+    let chunk_size: int = 262144
+    let chunk: int = hlib_sys::malloc(chunk_size)
+    ptr_write_i64(inb, 0, src.p)
+    ptr_write_i64(inb, 8, src.n)
+    ptr_write_i64(inb, 16, 0)
+    let w: hlib_bytes::Writer = hlib_bytes::writer_new(65536)
+    let mut failure: string = ""
+    let mut too_big: bool = false
+    while true is
+        ptr_write_i64(outb, 0, chunk)
+        ptr_write_i64(outb, 8, chunk_size)
+        ptr_write_i64(outb, 16, 0)
+        let r: int = hlib_sys::ZSTD_decompressStream(ds, outb, inb)
+        if hlib_sys::ZSTD_isError(r) != 0 is
+            failure = "decompression failed (corrupt or not zstd data)"
+            break
+        end
+        let produced: int = ptr_read_i64(outb, 16)
+        if produced > 0 is
+            if max_out > 0 && w.n + produced > max_out is
+                too_big = true
+                break
+            end
+            hlib_bytes::writer_push(w, chunk, produced)
+        end
+        let consumed: int = ptr_read_i64(inb, 16)
+        if r == 0 && consumed >= src.n is break end
+        if r != 0 && consumed >= src.n && produced == 0 is
+            failure = "truncated input"
+            break
+        end
+    end
+    hlib_sys::ZSTD_freeDStream(ds)
+    hlib_sys::free(inb)
+    hlib_sys::free(outb)
+    hlib_sys::free(chunk)
+    if too_big is
+        let wb: hlib_bytes::Buf = hlib_bytes::writer_finish(w)
+        hlib_bytes::buf_free(wb)
+        return option::Result::Err(hlib_error::limit("decompressed size exceeds " + to_string(max_out) + " bytes"))
+    end
+    if failure != "" is
+        let wb: hlib_bytes::Buf = hlib_bytes::writer_finish(w)
+        hlib_bytes::buf_free(wb)
+        return option::Result::Err(hlib_error::zstd(failure))
+    end
+    return option::Result::Ok(hlib_bytes::writer_finish(w))
+end
