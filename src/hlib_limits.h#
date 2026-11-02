@@ -1,0 +1,19 @@
+pub struct Limits is
+    pub max_archive_bytes: int      ;; compressed file on disk
+    pub max_unpacked_bytes: int     ;; the tar stream after decompression
+    pub max_entry_bytes: int        ;; one entry
+    pub max_entries: int            ;; number of entries
+    pub max_manifest_bytes: int     ;; manifest.json
+    pub max_json_depth: int         ;; nesting of arrays / objects in manifest.json
+end
+
+pub fn default_limits() -> Limits is
+    return Limits {
+        max_archive_bytes: 1073741824,        ;; 1 GiB
+        max_unpacked_bytes: 2147483648,       ;; 2 GiB
+        max_entry_bytes: 1073741824,          ;; 1 GiB
+        max_entries: 10000,
+        max_manifest_bytes: 16777216,         ;; 16 MiB
+        max_json_depth: 64
+    }
+end
