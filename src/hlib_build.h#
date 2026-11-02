@@ -1,0 +1,242 @@
+use "std -> option" from "option"
+use "std -> time" from "time"
+use "std -> env" from "env"
+
+mod hlib_error
+mod hlib_bytes
+mod hlib_limits
+mod hlib_crypto
+mod hlib_zstd
+mod hlib_tar
+mod hlib_manifest
+mod hlib_archive
+
+pub struct Builder is
+    pub name: string
+    pub version: string
+    pub language: string
+    pub language_version: string
+    pub edition: string
+    pub description: string
+    pub authors: [string]
+    pub dependencies: [hlib_manifest::Dependency]
+    pub exports: [hlib_manifest::Export]
+    pub artifacts: [hlib_manifest::Artifact]
+    pub entries: [hlib_tar::Entry]
+    pub created_at: string        ;; "" = now (or SOURCE_DATE_EPOCH)
+    pub level: int                ;; zstd level, default 19
+end
+
+pub struct Built is
+    pub archive: hlib_bytes::Buf
+    pub manifest: hlib_manifest::Manifest
+end
+
+;; `language` accepts any spelling `hlib_manifest::language_from_str` knows; name must be a valid
+;; library name. Errors are reported here, not at the end of a long build.
+pub fn builder_new(name: string, version: string, language: string) -> option::Result<Builder, hlib_error::HlibError> is
+    if !hlib_manifest::valid_name(name) is
+        return option::Result::Err(hlib_error::invalid("invalid library name `" + name + "` (use letters, digits, `.`, `_`, `+`, `-`; it must not start with `.` or `-`)"))
+    end
+    if version.len() == 0 || version.len() > 128 is
+        return option::Result::Err(hlib_error::invalid("the version must be 1 to 128 characters"))
+    end
+    let lang: string = hlib_manifest::language_from_str(language)?
+    return option::Result::Ok(Builder {
+        name: name, version: version, language: lang, language_version: "", edition: "",
+        description: "", authors: [], dependencies: [], exports: [], artifacts: [], entries: [],
+        created_at: "", level: hlib_zstd::default_level()
+    })
+end
+
+;; the H# edition recorded for an `hsharp` archive ("" = none)
+pub fn set_edition(b: Builder, edition: string) is
+    b.edition = edition
+end
+
+pub fn add_author(b: Builder, a: string) is
+    b.authors.push(a)
+end
+
+pub fn add_dependency(b: Builder, name: string, version_req: string) is
+    b.dependencies.push(hlib_manifest::Dependency { name: name, version_req: version_req })
+end
+
+pub fn add_export(b: Builder, e: hlib_manifest::Export) is
+    b.exports.push(e)
+end
+
+;; Adds one entry and records it as an artifact. `rel_path` must be a safe relative path and unique.
+pub fn add_entry(b: Builder, rel_path: string, kind: string, target: string, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    let reason: string = hlib_tar::unsafe_reason(rel_path)
+    if reason != "" is return option::Result::Err(hlib_error::unsafe_path(rel_path, reason)) end
+    if !hlib_manifest::valid_kind(kind) is
+        return option::Result::Err(hlib_error::invalid("unknown artifact kind `" + kind + "`"))
+    end
+    if rel_path == hlib_archive::manifest_entry() || rel_path == hlib_archive::checksums_entry() || rel_path == hlib_archive::signature_entry() is
+        return option::Result::Err(hlib_error::invalid("`" + rel_path + "` is reserved"))
+    end
+    for e in b.entries is
+        if e.path == rel_path is return option::Result::Err(hlib_error::duplicate_path(rel_path)) end
+    end
+    b.artifacts.push(hlib_manifest::Artifact { path: rel_path, kind: kind, target: target, sha256: hlib_crypto::sha256_hex(data), size: data.n })
+    b.entries.push(hlib_tar::Entry { path: rel_path, data: data })
+    return option::Result::Ok(true)
+end
+
+fn valid_target(t: string) -> bool is
+    if t.len() == 0 || t.len() > 100 is return false end
+    let mut i: int = 0
+    while i < t.len() is
+        let c: int = byte_at(t, i)
+        let ok: bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 45 || c == 46
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn add_shared_object(b: Builder, target: string, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    if !valid_target(target) is
+        return option::Result::Err(hlib_error::invalid("invalid target triple `" + target + "`"))
+    end
+    return add_entry(b, "native/" + target + "/" + b.name + ".so", "shared_object", target, data)
+end
+
+pub fn add_bytecode(b: Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return add_entry(b, "bytecode/" + b.name + ".hlbc", "bytecode", "", data)
+end
+
+;; H# / Hacker Lang: ast/<name>.ast.json
+pub fn add_ast_json(b: Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return add_entry(b, "ast/" + b.name + ".ast.json", "ast", "", data)
+end
+
+;; HackerScript: ast/<name>.hcs (the verbatim source text)
+pub fn add_ast_source(b: Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return add_entry(b, "ast/" + b.name + ".hcs", "ast", "", data)
+end
+
+;; the ast artifact in the encoding of the archive's own language
+pub fn add_ast(b: Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    if b.language == "hackerscript" is return add_ast_source(b, data) end
+    return add_ast_json(b, data)
+end
+
+pub fn add_header(b: Builder, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    return add_entry(b, "headers/" + b.name + ".iface.json", "header", "", data)
+end
+
+pub fn add_extra(b: Builder, rel_name: string, data: hlib_bytes::Buf) -> option::Result<bool, hlib_error::HlibError> is
+    let mut r: string = rel_name
+    while r.len() > 0 && byte_at(r, 0) == 47 is r = r[1..r.len()] end
+    return add_entry(b, "extra/" + r, "extra", "", data)
+end
+
+;; reads `file` and adds it with `add_entry`
+pub fn add_file(b: Builder, rel_path: string, kind: string, target: string, file: string) -> option::Result<bool, hlib_error::HlibError> is
+    let data: hlib_bytes::Buf = hlib_bytes::read_file(file, 1073741824)?
+    return add_entry(b, rel_path, kind, target, data)
+end
+
+;; ── time ──────────────────────────────────────────────────────────────────────
+
+fn two(n: int) -> string is
+    return if n < 10 is "0" + to_string(n) else to_string(n) end
+end
+
+;; unix seconds -> "YYYY-MM-DDTHH:MM:SSZ"
+pub fn rfc3339(ts: int) -> string is
+    let days: int = ts / 86400
+    let rem: int = ts % 86400
+    let z: int = days + 719468
+    let era: int = z / 146097
+    let doe: int = z - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let mut y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let m: int = if mp < 10 is mp + 3 else mp - 9 end
+    if m <= 2 is y += 1 end
+    return to_string(y) + "-" + two(m) + "-" + two(d) + "T" + two(rem / 3600) + ":" + two((rem % 3600) / 60) + ":" + two(rem % 60) + "Z"
+end
+
+fn parse_uint(s: string) -> int is
+    if s.len() == 0 || s.len() > 12 is return -1 end
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return -1 end
+        v = v * 10 + (c - 48)
+        i += 1
+    end
+    return v
+end
+
+fn timestamp(b: Builder) -> string is
+    if b.created_at != "" is return b.created_at end
+    let sde: int = parse_uint(env::get("SOURCE_DATE_EPOCH"))
+    if sde >= 0 is return rfc3339(sde) end
+    return rfc3339(time::now_unix())
+end
+
+;; ── assemble ──────────────────────────────────────────────────────────────────
+
+;; Checksums, optional signature, manifest, tar, zstd — in memory. `signing_key_hex` "" = unsigned.
+pub fn build_bytes(b: Builder, signing_key_hex: string) -> option::Result<Built, hlib_error::HlibError> is
+    let mut paths: [string] = []
+    for e in b.entries is paths.push(e.path) end
+    let order: [int] = hlib_bytes::sort_order(paths)
+    let mut lines: [string] = []
+    for i in order is
+        lines.push(hlib_crypto::sha256_hex(b.entries[i].data) + "  " + b.entries[i].path + "\n")
+    end
+    let checksums: hlib_bytes::Buf = hlib_bytes::buf_from_str(hlib_bytes::join(lines, ""))
+
+    let mut all: [hlib_tar::Entry] = []
+    let mut signed: bool = false
+    let mut public_key: string = ""
+    if signing_key_hex.len() > 0 is
+        let sig: hlib_bytes::Buf = hlib_crypto::sign(signing_key_hex, checksums)?
+        public_key = hlib_crypto::public_key_hex(signing_key_hex)?
+        all.push(hlib_tar::Entry { path: hlib_archive::signature_entry(), data: sig })
+        signed = true
+    end
+    all.push(hlib_tar::Entry { path: hlib_archive::checksums_entry(), data: checksums })
+    for e in b.entries is all.push(e) end
+
+    let m: hlib_manifest::Manifest = hlib_manifest::Manifest {
+        spec_version: hlib_manifest::spec_version(), name: b.name, version: b.version, language: b.language,
+        language_version: b.language_version, edition: if b.language == "hsharp" is b.edition else "" end,
+        abi_version: 1, description: b.description, authors: b.authors, created_at: timestamp(b),
+        dependencies: b.dependencies, artifacts: b.artifacts, exports: b.exports,
+        signed: signed, sig_algorithm: "ed25519", sig_public_key: public_key, sig_entry: hlib_archive::checksums_entry()
+    }
+    let manifest_buf: hlib_bytes::Buf = hlib_bytes::buf_from_str(hlib_manifest::to_json(m))
+    all.push(hlib_tar::Entry { path: hlib_archive::manifest_entry(), data: manifest_buf })
+
+    let mut keys: [string] = []
+    for e in all is
+        let rank: string = if e.path == hlib_archive::manifest_entry() is "0" elsif e.path == hlib_archive::checksums_entry() is "1" elsif e.path == hlib_archive::signature_entry() is "2" else "3" end
+        keys.push(rank + e.path)
+    end
+    let ord: [int] = hlib_bytes::sort_order(keys)
+    let mut sorted: [hlib_tar::Entry] = []
+    for i in ord is sorted.push(all[i]) end
+
+    let lim: hlib_limits::Limits = hlib_limits::default_limits()
+    let tar: hlib_bytes::Buf = hlib_tar::write(sorted, lim.max_unpacked_bytes)?
+    let packed: hlib_bytes::Buf = hlib_zstd::compress(tar, b.level)?
+    hlib_bytes::buf_free(tar)
+    return option::Result::Ok(Built { archive: packed, manifest: m })
+end
+
+;; build_bytes + atomic write to `output_path`
+pub fn finish(b: Builder, output_path: string, signing_key_hex: string) -> option::Result<hlib_manifest::Manifest, hlib_error::HlibError> is
+    let built: Built = build_bytes(b, signing_key_hex)?
+    hlib_bytes::make_dirs(hlib_bytes::parent_dir(output_path))
+    hlib_bytes::write_file(output_path, built.archive)?
+    return option::Result::Ok(built.manifest)
+end
