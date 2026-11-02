@@ -1,0 +1,318 @@
+use "std -> option" from "option"
+use "std -> fs" from "fs"
+
+mod hlib_error
+mod hlib_bytes
+mod hlib_limits
+mod hlib_crypto
+mod hlib_zstd
+mod hlib_tar
+mod hlib_manifest
+
+pub fn manifest_entry() -> string is return "manifest.json" end
+pub fn checksums_entry() -> string is return "CHECKSUMS.sha256" end
+pub fn signature_entry() -> string is return "SIGNATURE.ed25519" end
+
+pub struct Archive is
+    pub path: string
+    pub manifest: hlib_manifest::Manifest
+    pub entries: [hlib_tar::Entry]
+    pub order: [int]              ;; indices into `entries`, sorted by path
+end
+
+;; ── lookup ────────────────────────────────────────────────────────────────────
+
+;; index of the entry named `path`, or -1 (binary search)
+pub fn entry_index(a: Archive, path: string) -> int is
+    let mut lo: int = 0
+    let mut hi: int = a.order.len() - 1
+    while lo <= hi is
+        let mid: int = (lo + hi) / 2
+        let c: int = hlib_bytes::cmp_str(a.entries[a.order[mid]].path, path)
+        if c == 0 is return a.order[mid] end
+        if c < 0 is lo = mid + 1 else hi = mid - 1 end
+    end
+    return -1
+end
+
+pub fn has_entry(a: Archive, path: string) -> bool is
+    return entry_index(a, path) >= 0
+end
+
+pub fn entry_paths(a: Archive) -> [string] is
+    let mut out: [string] = []
+    for i in a.order is out.push(a.entries[i].path) end
+    return out
+end
+
+;; the bytes of an entry (shared with the archive — do not free), or an empty Buf when absent
+pub fn entry_bytes(a: Archive, path: string) -> option::Result<hlib_bytes::Buf, hlib_error::HlibError> is
+    let i: int = entry_index(a, path)
+    if i < 0 is return option::Result::Err(hlib_error::missing_entry(path)) end
+    return option::Result::Ok(a.entries[i].data)
+end
+
+;; ── open ──────────────────────────────────────────────────────────────────────
+
+;; Opens an archive that is already in memory (`display` is only used in messages).
+pub fn open_bytes(compressed: hlib_bytes::Buf, display: string, lim: hlib_limits::Limits) -> option::Result<Archive, hlib_error::HlibError> is
+    let mut tar: hlib_bytes::Buf = hlib_bytes::buf_new(0)
+    match hlib_zstd::decompress(compressed, lim.max_unpacked_bytes) is
+        option::Result::Ok(t) => is tar = t end
+        option::Result::Err(e) => is
+            if e.code == "limit" is return option::Result::Err(e) end
+            return option::Result::Err(hlib_error::not_archive(display))
+        end
+    end
+    let mut entries: [hlib_tar::Entry] = []
+    match hlib_tar::read(tar, lim) is
+        option::Result::Ok(es) => is entries = es end
+        option::Result::Err(e) => is
+            ;; keep the specific reason (links, unsafe paths, limits, bad checksums); only a stream that
+            ;; is not tar at all is reported as "not a valid .hlib archive"
+            if hlib_bytes::starts_with(e.message, "malformed tar archive: not a ustar") is
+                return option::Result::Err(hlib_error::not_archive(display))
+            end
+            return option::Result::Err(e)
+        end
+    end
+    hlib_bytes::buf_free(tar)
+    let mut paths: [string] = []
+    for e in entries is paths.push(e.path) end
+    let order: [int] = hlib_bytes::sort_order(paths)
+    let mut k: int = 1
+    while k < order.len() is
+        if paths[order[k]] == paths[order[k - 1]] is
+            return option::Result::Err(hlib_error::duplicate_path(paths[order[k]]))
+        end
+        k += 1
+    end
+    let shell: Archive = Archive { path: display, manifest: hlib_manifest::empty(), entries: entries, order: order }
+    let mi: int = entry_index(shell, manifest_entry())
+    if mi < 0 is return option::Result::Err(hlib_error::missing_entry(manifest_entry())) end
+    let m: hlib_manifest::Manifest = hlib_manifest::parse(entries[mi].data, lim)?
+    shell.manifest = m
+    return option::Result::Ok(shell)
+end
+
+pub fn open_with(path: string, lim: hlib_limits::Limits) -> option::Result<Archive, hlib_error::HlibError> is
+    let raw: hlib_bytes::Buf = hlib_bytes::read_file(path, lim.max_archive_bytes)?
+    let r = open_bytes(raw, path, lim)
+    hlib_bytes::buf_free(raw)
+    return r
+end
+
+pub fn open(path: string) -> option::Result<Archive, hlib_error::HlibError> is
+    return open_with(path, hlib_limits::default_limits())
+end
+
+;; Reads only manifest.json (still decompresses the archive; nothing is hashed).
+pub fn read_manifest_json(path: string) -> option::Result<string, hlib_error::HlibError> is
+    let a: Archive = open(path)?
+    let i: int = entry_index(a, manifest_entry())
+    return option::Result::Ok(hlib_bytes::buf_to_str(a.entries[i].data))
+end
+
+;; ── checksums ─────────────────────────────────────────────────────────────────
+
+struct SumLine is
+    pub digest: string
+    pub path: string
+end
+
+fn parse_sums(a: Archive) -> option::Result<[SumLine], hlib_error::HlibError> is
+    let ci: int = entry_index(a, checksums_entry())
+    if ci < 0 is return option::Result::Err(hlib_error::missing_entry(checksums_entry())) end
+    let text: string = hlib_bytes::buf_to_str(a.entries[ci].data)
+    let mut out: [SumLine] = []
+    let mut start: int = 0
+    while start <= text.len() is
+        let mut e: int = start
+        while e < text.len() && byte_at(text, e) != 10 is e += 1 end
+        let line: string = hlib_bytes::trim_ws(text[start..e])
+        start = e + 1
+        if line.len() == 0 is continue end
+        let sep: int = hlib_bytes::find_from(line, "  ", 0)
+        if sep < 0 is return option::Result::Err(hlib_error::malformed_checksums(line)) end
+        let digest: string = line[0..sep]
+        let path: string = line[sep + 2..line.len()]
+        if !hlib_bytes::is_hex(digest, 64) || path.len() == 0 is
+            return option::Result::Err(hlib_error::malformed_checksums(line))
+        end
+        out.push(SumLine { digest: hlib_bytes::lower(digest), path: path })
+    end
+    return option::Result::Ok(out)
+end
+
+;; Compat level: every line of CHECKSUMS.sha256 names an entry whose SHA-256 matches.
+pub fn verify_checksums(a: Archive) -> option::Result<bool, hlib_error::HlibError> is
+    let sums: [SumLine] = parse_sums(a)?
+    for s in sums is
+        let di: int = entry_index(a, s.path)
+        if di < 0 is return option::Result::Err(hlib_error::missing_entry(s.path)) end
+        let actual: string = hlib_crypto::sha256_hex(a.entries[di].data)
+        if actual != s.digest is
+            return option::Result::Err(hlib_error::checksum_mismatch(s.path, s.digest, actual))
+        end
+    end
+    return option::Result::Ok(true)
+end
+
+;; Compat level: SIGNATURE.ed25519 verifies over CHECKSUMS.sha256 against `pubkey_hex`.
+;; The key is the caller's — never trust `manifest.signature.public_key` by itself.
+pub fn verify_signature(a: Archive, pubkey_hex: string) -> option::Result<bool, hlib_error::HlibError> is
+    let si: int = entry_index(a, signature_entry())
+    if si < 0 is return option::Result::Err(hlib_error::unsigned()) end
+    let ci: int = entry_index(a, checksums_entry())
+    if ci < 0 is return option::Result::Err(hlib_error::missing_entry(checksums_entry())) end
+    let ok: bool = hlib_crypto::verify(pubkey_hex, a.entries[ci].data, a.entries[si].data)?
+    if ok is return option::Result::Ok(true) end
+    return option::Result::Err(hlib_error::bad_signature())
+end
+
+;; ── strict check ──────────────────────────────────────────────────────────────
+
+pub struct Report is
+    pub ok: bool
+    pub signed: bool
+    pub signature_valid: bool     ;; only meaningful when `signed`
+    pub trusted: bool             ;; the signature verified against the caller's key (not just the embedded one)
+    pub problems: [string]
+end
+
+fn is_meta(path: string) -> bool is
+    return path == manifest_entry() || path == checksums_entry() || path == signature_entry()
+end
+
+;; Full verification. `trusted_key_hex` may be "" (then a signature is only checked against the key
+;; embedded in the manifest: it proves consistency, not authenticity — `trusted` stays false).
+pub fn check(a: Archive, trusted_key_hex: string) -> Report is
+    let mut problems: [string] = []
+    let mut sig_valid: bool = false
+    let mut trusted: bool = false
+    let m: hlib_manifest::Manifest = a.manifest
+
+    let mut sums: [SumLine] = []
+    let mut have_sums: bool = false
+    match parse_sums(a) is
+        option::Result::Ok(s) => is
+            sums = s
+            have_sums = true
+        end
+        option::Result::Err(e) => is problems.push(e.message) end
+    end
+
+    let mut listed: [string] = []
+    let mut lorder: [int] = []
+    if have_sums is
+        for s in sums is
+            listed.push(s.path)
+            let di: int = entry_index(a, s.path)
+            if di < 0 is
+                problems.push("CHECKSUMS.sha256 lists `" + s.path + "` which is not in the archive")
+            else
+                let actual: string = hlib_crypto::sha256_hex(a.entries[di].data)
+                if actual != s.digest is
+                    problems.push(hlib_error::checksum_mismatch(s.path, s.digest, actual).message)
+                end
+            end
+        end
+        lorder = hlib_bytes::sort_order(listed)
+        let mut k: int = 1
+        while k < lorder.len() is
+            if listed[lorder[k]] == listed[lorder[k - 1]] is problems.push("CHECKSUMS.sha256 lists `" + listed[lorder[k]] + "` twice") end
+            k += 1
+        end
+        for p in entry_paths(a) is
+            if !is_meta(p) && hlib_bytes::sorted_find(listed, lorder, p) < 0 is
+                problems.push("entry `" + p + "` is not covered by CHECKSUMS.sha256")
+            end
+        end
+    end
+
+    for art in m.artifacts is
+        let di: int = entry_index(a, art.path)
+        if di < 0 is
+            problems.push("manifest artifact `" + art.path + "` is not in the archive")
+        else
+            let actual: string = hlib_crypto::sha256_hex(a.entries[di].data)
+            if actual != hlib_bytes::lower(art.sha256) is problems.push("manifest sha256 of `" + art.path + "` does not match the archive") end
+            if a.entries[di].data.n != art.size is problems.push("manifest size of `" + art.path + "` does not match the archive") end
+            if have_sums && hlib_bytes::sorted_find(listed, lorder, art.path) < 0 is
+                problems.push("manifest artifact `" + art.path + "` is not covered by CHECKSUMS.sha256")
+            end
+        end
+    end
+    if have_sums is
+        let mut apaths: [string] = []
+        for art in m.artifacts is apaths.push(art.path) end
+        let aorder: [int] = hlib_bytes::sort_order(apaths)
+        for l in listed is
+            if hlib_bytes::sorted_find(apaths, aorder, l) < 0 is
+                problems.push("CHECKSUMS.sha256 covers `" + l + "` which the manifest does not list")
+            end
+        end
+    end
+
+    let has_sig_entry: bool = has_entry(a, signature_entry())
+    if m.signed != has_sig_entry is
+        problems.push(if m.signed is "manifest declares a signature but SIGNATURE.ed25519 is missing" else "SIGNATURE.ed25519 is present but the manifest declares no signature" end)
+    end
+    if m.signed is
+        if m.sig_algorithm != "ed25519" is problems.push("unsupported signature algorithm `" + m.sig_algorithm + "`") end
+        if m.sig_entry != checksums_entry() is problems.push("signed_entry must be CHECKSUMS.sha256, found `" + m.sig_entry + "`") end
+    end
+    if has_sig_entry is
+        let key: string = if trusted_key_hex != "" is trusted_key_hex else m.sig_public_key end
+        match verify_signature(a, key) is
+            option::Result::Ok(_) => is
+                sig_valid = true
+                if trusted_key_hex != "" is
+                    trusted = true
+                elsif m.signed is
+                    ;; consistent with the embedded key only
+                    trusted = false
+                end
+            end
+            option::Result::Err(e) => is problems.push(e.message) end
+        end
+        if trusted_key_hex != "" && m.signed && hlib_bytes::lower(trusted_key_hex) != hlib_bytes::lower(m.sig_public_key) is
+            problems.push("the manifest's public key differs from the trusted key")
+        end
+    elsif trusted_key_hex != "" is
+        problems.push(hlib_error::unsigned().message)
+    end
+    return Report { ok: problems.len() == 0, signed: has_sig_entry, signature_valid: sig_valid, trusted: trusted, problems: problems }
+end
+
+;; check(), as a Result: Err(strict) carrying every problem, one per line
+pub fn check_strict(a: Archive, trusted_key_hex: string) -> option::Result<Report, hlib_error::HlibError> is
+    let r: Report = check(a, trusted_key_hex)
+    if r.ok is return option::Result::Ok(r) end
+    return option::Result::Err(hlib_error::make("strict", hlib_bytes::join(r.problems, "\n")))
+end
+
+;; ── extraction ────────────────────────────────────────────────────────────────
+
+;; Writes one entry to `dest` (parent directories are created, the file is replaced atomically).
+pub fn extract_entry(a: Archive, path: string, dest: string) -> option::Result<bool, hlib_error::HlibError> is
+    let i: int = entry_index(a, path)
+    if i < 0 is return option::Result::Err(hlib_error::missing_entry(path)) end
+    hlib_bytes::make_dirs(hlib_bytes::parent_dir(dest))
+    return hlib_bytes::write_file(dest, a.entries[i].data)
+end
+
+;; Extracts every entry under `dir`. Entry paths were validated when the archive was opened
+;; (relative, no `..`, no links), so nothing lands outside `dir`. Extract into a fresh directory:
+;; a symlink that already exists *inside* `dir` along an entry's directory path would be followed.
+pub fn extract_to_dir(a: Archive, dir: string) -> option::Result<bool, hlib_error::HlibError> is
+    hlib_bytes::make_dirs(dir)
+    for e in a.entries is
+        let reason: string = hlib_tar::unsafe_reason(e.path)
+        if reason != "" is return option::Result::Err(hlib_error::unsafe_path(e.path, reason)) end
+        let dest: string = dir + "/" + e.path
+        hlib_bytes::make_dirs(hlib_bytes::parent_dir(dest))
+        hlib_bytes::write_file(dest, e.data)?
+    end
+    return option::Result::Ok(true)
+end
